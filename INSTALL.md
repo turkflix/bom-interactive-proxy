@@ -4,8 +4,22 @@
 
 ### Step 1: Run the Proxy Service
 
+#### Option A: Pre-built Image (Recommended)
 ```bash
-# Clone and start the proxy
+# Run the latest build from GitHub Container Registry
+docker run -d --name bom-proxy \
+  -p 8083:80 \
+  --restart unless-stopped \
+  ghcr.io/turkflix/bom-interactive-proxy:latest
+
+# Verify it's running
+curl http://192.168.86.62:8083/health
+# Should return: OK
+```
+
+#### Option B: Docker Compose (Pre-built)
+```bash
+# Clone and start with pre-built image
 git clone https://github.com/turkflix/bom-interactive-proxy.git
 cd bom-interactive-proxy
 docker-compose up -d
@@ -13,6 +27,14 @@ docker-compose up -d
 # Verify it's running
 curl http://192.168.86.62:8083/health
 # Should return: OK
+```
+
+#### Option C: Build from Source
+```bash
+# Clone and build locally
+git clone https://github.com/turkflix/bom-interactive-proxy.git
+cd bom-interactive-proxy
+docker-compose -f docker-compose.dev.yml up -d
 ```
 
 ### Step 2: Install Home Assistant Card

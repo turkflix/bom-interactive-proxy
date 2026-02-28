@@ -14,9 +14,16 @@ Instead of static cached frames, this proxy provides the **full interactive BOM 
 
 ## 🚀 Quick Start
 
-### 1. Run the Proxy
+### 1. Run the Proxy (Pre-built Image)
 ```bash
-docker run -p 8083:80 ghcr.io/turkflix/bom-interactive-proxy:latest
+docker run -d --name bom-proxy -p 8083:80 ghcr.io/turkflix/bom-interactive-proxy:latest
+```
+
+### 1. Alternative: Build from Source
+```bash
+git clone https://github.com/turkflix/bom-interactive-proxy.git
+cd bom-interactive-proxy
+docker-compose up -d
 ```
 
 ### 2. Add to Home Assistant
