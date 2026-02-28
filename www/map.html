@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BOM Interactive Weather Map</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #000;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        .map-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+
+        .map-frame {
+            width: 100%;
+            height: 100%;
+            border: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            text-align: center;
+            z-index: 100;
+        }
+
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #333;
+            border-top: 4px solid #0080ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            text-align: center;
+            padding: 20px;
+            background: rgba(220, 53, 69, 0.9);
+            border-radius: 8px;
+            max-width: 300px;
+        }
+    </style>
+</head>
+<body>
+    <div class="map-container">
+        <div class="loading" id="loading">
+            <div class="loading-spinner"></div>
+            <div>Loading Interactive Weather Map...</div>
+        </div>
+        
+        <div class="error" id="error" style="display: none;">
+            <h3>🌧️ Unable to Load Map</h3>
+            <p>Check that the BOM proxy service is running and accessible.</p>
+        </div>
+
+        <iframe 
+            id="mapFrame" 
+            class="map-frame"
+            style="display: none;"
+            sandbox="allow-scripts allow-same-origin allow-forms"
+            loading="eager">
+        </iframe>
+    </div>
+
+    <script>
+        class BOMMap {
+            constructor() {
+                this.frame = document.getElementById('mapFrame');
+                this.loading = document.getElementById('loading');
+                this.error = document.getElementById('error');
+                this.init();
+            }
+
+            async init() {
+                try {
+                    // Get location from URL parameters or default to Ashburton
+                    const params = new URLSearchParams(window.location.search);
+                    const location = params.get('location') || 'ashburton';
+                    const state = params.get('state') || 'vic';
+                    const bomPath = params.get('path') || 'australia/victoria/central/o2594692629-ashburton';
+
+                    // Build the proxied BOM URL
+                    const bomUrl = `/location/${bomPath}`;
+                    
+                    console.log('Loading BOM map from:', bomUrl);
+                    
+                    // Set up iframe
+                    this.frame.addEventListener('load', () => this.onFrameLoad());
+                    this.frame.addEventListener('error', () => this.onFrameError());
+                    
+                    // Load the BOM page
+                    this.frame.src = bomUrl;
+                    
+                    // Timeout after 30 seconds
+                    setTimeout(() => {
+                        if (this.loading.style.display !== 'none') {
+                            this.onFrameError('Timeout loading map');
+                        }
+                    }, 30000);
+                    
+                } catch (err) {
+                    console.error('Error initializing map:', err);
+                    this.onFrameError(err.message);
+                }
+            }
+
+            onFrameLoad() {
+                console.log('BOM map loaded successfully');
+                
+                try {
+                    // Try to access frame content to clean it up
+                    const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
+                    
+                    if (frameDoc) {
+                        // Hide unnecessary elements to show just the map
+                        this.cleanupBOMPage(frameDoc);
+                    }
+                } catch (err) {
+                    // Cross-origin restrictions - that's OK, frame will still work
+                    console.log('Cannot access frame content (CORS), but map should still work');
+                }
+                
+                // Hide loading, show map
+                this.loading.style.display = 'none';
+                this.frame.style.display = 'block';
+                
+                // Focus the frame for interactions
+                setTimeout(() => {
+                    this.frame.focus();
+                }, 100);
+            }
+
+            onFrameError(message = 'Failed to load map') {
+                console.error('Frame error:', message);
+                this.loading.style.display = 'none';
+                this.error.style.display = 'block';
+                this.error.querySelector('p').textContent = message;
+            }
+
+            cleanupBOMPage(doc) {
+                try {
+                    // Hide navigation, footer, and other non-map elements
+                    const selectorsToHide = [
+                        'header',
+                        'nav',
+                        'footer', 
+                        '.header',
+                        '.navigation',
+                        '.breadcrumb',
+                        '.bom-header',
+                        '.bom-footer',
+                        '.bom-navigation'
+                    ];
+
+                    selectorsToHide.forEach(selector => {
+                        const elements = doc.querySelectorAll(selector);
+                        elements.forEach(el => el.style.display = 'none');
+                    });
+
+                    // Focus on map container if found
+                    const mapContainer = doc.querySelector('[data-map]') || 
+                                       doc.querySelector('.map-container') ||
+                                       doc.querySelector('#map');
+                    
+                    if (mapContainer) {
+                        mapContainer.style.width = '100%';
+                        mapContainer.style.height = '100vh';
+                    }
+
+                    // Remove page margins/padding
+                    doc.body.style.margin = '0';
+                    doc.body.style.padding = '0';
+                    doc.body.style.overflow = 'hidden';
+
+                } catch (err) {
+                    console.warn('Could not clean up BOM page:', err);
+                }
+            }
+        }
+
+        // Initialize when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new BOMMap();
+        });
+
+        // Handle messages from parent (Home Assistant)
+        window.addEventListener('message', (event) => {
+            if (event.data.type === 'resize') {
+                // Handle resize events from HA
+                console.log('Resize requested:', event.data);
+            }
+        });
+    </script>
+</body>
+</html>
