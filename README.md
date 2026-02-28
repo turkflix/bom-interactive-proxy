@@ -19,14 +19,30 @@ Instead of static cached frames, this proxy provides the **full interactive BOM 
 docker run -d --name bom-proxy -p 8083:80 ghcr.io/turkflix/bom-interactive-proxy:latest
 ```
 
-### 1. Alternative: Build from Source
+### 2. Test the Proxy (Before Home Assistant)
+```bash
+# Download the test page
+curl -O https://raw.githubusercontent.com/turkflix/bom-interactive-proxy/main/test-page.html
+
+# Open in browser
+open test-page.html  # macOS
+# or just double-click the file
+```
+
+The test page will:
+- ✅ **Test proxy connectivity** - health, CORS, BOM access
+- 🗺️ **Show interactive map** - exactly like it will appear in HA  
+- 🐛 **Debug information** - logs and troubleshooting
+- 🎮 **Location controls** - test different Australian locations
+
+### 3. Alternative: Build from Source
 ```bash
 git clone https://github.com/turkflix/bom-interactive-proxy.git
 cd bom-interactive-proxy
 docker-compose up -d
 ```
 
-### 2. Add to Home Assistant
+### 4. Add to Home Assistant
 ```yaml
 type: custom:bom-interactive-map
 proxy_url: http://192.168.86.62:8083
