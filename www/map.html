@@ -100,16 +100,131 @@
                 this.frame = document.getElementById('mapFrame');
                 this.loading = document.getElementById('loading');
                 this.error = document.getElementById('error');
+                this.bomPath = null;
+                this.cleanupEnabled = false;
+                this.mapOnlyEnabled = false;
+                this.forceRain = false;
+                this.showFrameTime = false;
+                this.animate = true;
+                this.lowPower = false;
+                this.animateMode = 'native';
+                this.animateIntervalMs = 2000;
+                this.frameSkip = 1;
+                this.throttledAnimationTimer = null;
+                this.lastThrottledAnimationAt = 0;
+                this.frameTimeOverlay = null;
+                this.frameTimeTimer = null;
+                this.frameTimeIntervalMs = 5000;
+                this.viewMoreObserver = null;
+                this.hoverSuppressionCleanup = null;
+                this.playbackPaused = false;
+                this.playbackPauseAttempts = 0;
+                this.maxPlaybackPauseAttempts = 30;
+                this.playbackLastActionAt = 0;
+                this.requestedZoom = null;
+                this.zoomLastActionAt = 0;
+                this.lastKnownZoom = null;
+                this.zoomFallbackBase = 7;
+                this.zoomVirtualLevel = 7;
+                this.zoomActionsTaken = 0;
+                this.zoomMaxActions = 20;
+                this.zoomSessionStartedAt = 0;
+                this.zoomPendingDirection = 0;
+                this.zoomPendingSince = 0;
+                this.zoomPendingFrom = null;
+                this.zoomActionIntervalMs = 1200;
+                this.zoomWaitForChangeMs = 3500;
+                this.zoomSessionMaxDurationMs = 45000;
+                this.cleanupAttempts = 0;
+                this.maxCleanupAttempts = 60;
+                this.cleanupTimer = null;
+                this.renderNotified = false;
+                this.frameLoadHandled = false;
+                this.frameSoftLoadTimer = null;
                 this.init();
+            }
+
+            notifyParent(status, detail = '') {
+                if (!window.parent || window.parent === window) {
+                    return;
+                }
+
+                window.parent.postMessage({
+                    source: 'bom-map-page',
+                    type: 'bom-map-status',
+                    status,
+                    detail,
+                    path: this.bomPath
+                }, '*');
+            }
+
+            async registerMapCacheWorker() {
+                if (!('serviceWorker' in navigator)) {
+                    return;
+                }
+
+                try {
+                    const registration = await navigator.serviceWorker.register('/map-sw.js', { scope: '/' });
+                    if (registration && registration.waiting) {
+                        registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+                    }
+                    await navigator.serviceWorker.ready;
+                } catch (error) {
+                    // Sandboxed contexts can block service worker registration.
+                    console.warn('Map cache service worker registration failed:', error && error.message ? error.message : error);
+                }
             }
 
             async init() {
                 try {
+                    await this.registerMapCacheWorker();
+
                     // Get location from URL parameters or default to Ashburton
                     const params = new URLSearchParams(window.location.search);
-                    const location = params.get('location') || 'ashburton';
-                    const state = params.get('state') || 'vic';
-                    const bomPath = params.get('path') || 'australia/victoria/central/o2594692629-ashburton';
+                    const bomPath = await this.resolveLocationPath(params);
+                    const cleanup = params.get('cleanup') === '1';
+                    const mapOnly = params.get('mapOnly') === '1' || params.get('mode') === 'maponly';
+                    const rain = params.get('rain') === '1';
+                    const lowPowerParam = params.get('lowPower') ?? params.get('lowpower');
+                    const animateParam = params.get('animate') ?? params.get('autoplay');
+                    const animateModeParam = params.get('animateMode') ?? params.get('animatemode');
+                    const animateIntervalParam = params.get('animateInterval') ?? params.get('animatems');
+                    const frameSkipParam = params.get('frameSkip') ?? params.get('frameskip');
+                    const showFrameTimeParam = params.get('showFrameTime') ?? params.get('showTime');
+                    const lowPower =
+                        lowPowerParam !== null &&
+                        !['0', 'false', 'off', 'no'].includes(String(lowPowerParam).trim().toLowerCase());
+                    const showFrameTime =
+                        showFrameTimeParam === null
+                            ? mapOnly
+                            : !['0', 'false', 'off', 'no'].includes(String(showFrameTimeParam).trim().toLowerCase());
+                    const animate =
+                        animateParam === null
+                            ? !mapOnly
+                            : !['0', 'false', 'off', 'no'].includes(String(animateParam).trim().toLowerCase());
+                    const animateMode = this.parseAnimateMode(animateModeParam);
+                    const animateIntervalMs = this.parseAnimateInterval(animateIntervalParam);
+                    const frameSkip = this.parseFrameSkip(frameSkipParam);
+                    const requestedZoom = this.parseRequestedZoom(params.get('zoom'));
+                    this.bomPath = bomPath;
+                    this.mapOnlyEnabled = mapOnly;
+                    this.forceRain = rain || mapOnly;
+                    this.lowPower = lowPower;
+                    this.showFrameTime = lowPower ? false : showFrameTime;
+                    this.animate = lowPower ? false : animate;
+                    this.animateMode = animateMode;
+                    this.animateIntervalMs = animateIntervalMs;
+                    this.frameSkip = frameSkip;
+                    this.lastThrottledAnimationAt = 0;
+                    this.setRequestedZoom(requestedZoom);
+                    this.cleanupEnabled = cleanup || this.mapOnlyEnabled || this.forceRain;
+                    this.playbackPaused = false;
+                    this.playbackPauseAttempts = 0;
+                    this.playbackLastActionAt = 0;
+                    if (this.lowPower) {
+                        this.maxCleanupAttempts = 30;
+                        this.frameTimeIntervalMs = 15000;
+                    }
 
                     // Build the proxied BOM URL
                     const bomUrl = `/location/${bomPath}`;
@@ -117,11 +232,40 @@
                     console.log('Loading BOM map from:', bomUrl);
                     
                     // Set up iframe
+                    this.frameLoadHandled = false;
                     this.frame.addEventListener('load', () => this.onFrameLoad());
                     this.frame.addEventListener('error', () => this.onFrameError());
                     
                     // Load the BOM page
                     this.frame.src = bomUrl;
+
+                    // Fallback: some BOM pages can delay window load while still rendering map content.
+                    const softLoadStartedAt = Date.now();
+                    if (this.frameSoftLoadTimer) {
+                        clearInterval(this.frameSoftLoadTimer);
+                    }
+                    this.frameSoftLoadTimer = setInterval(() => {
+                        if (this.frameLoadHandled) {
+                            clearInterval(this.frameSoftLoadTimer);
+                            this.frameSoftLoadTimer = null;
+                            return;
+                        }
+
+                        try {
+                            const frameDoc = this.frame.contentDocument || (this.frame.contentWindow && this.frame.contentWindow.document);
+                            if (frameDoc && frameDoc.body && frameDoc.readyState && frameDoc.readyState !== 'loading') {
+                                this.onFrameLoad();
+                                return;
+                            }
+                        } catch (error) {
+                            // Ignore transient frame access errors while it boots.
+                        }
+
+                        if (Date.now() - softLoadStartedAt > 30000) {
+                            clearInterval(this.frameSoftLoadTimer);
+                            this.frameSoftLoadTimer = null;
+                        }
+                    }, 500);
                     
                     // Timeout after 30 seconds
                     setTimeout(() => {
@@ -136,26 +280,298 @@
                 }
             }
 
-            onFrameLoad() {
-                console.log('BOM map loaded successfully');
-                
-                try {
-                    // Try to access frame content to clean it up
-                    const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
-                    
-                    if (frameDoc) {
-                        // Hide unnecessary elements to show just the map
-                        this.cleanupBOMPage(frameDoc);
+            sanitizePath(path) {
+                return String(path || '').trim().replace(/^\/+|\/+$/g, '');
+            }
+
+            slugify(value) {
+                return String(value || '')
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '-')
+                    .replace(/^-+|-+$/g, '');
+            }
+
+            expandStateCode(stateCode) {
+                const states = {
+                    act: 'australian-capital-territory',
+                    nsw: 'new-south-wales',
+                    nt: 'northern-territory',
+                    qld: 'queensland',
+                    sa: 'south-australia',
+                    tas: 'tasmania',
+                    vic: 'victoria',
+                    wa: 'western-australia'
+                };
+
+                const key = String(stateCode || '').trim().toLowerCase();
+                return states[key] || this.slugify(stateCode);
+            }
+
+            parseCoordinates(params) {
+                let lat = params.get('lat') || params.get('latitude');
+                let lon = params.get('lon') || params.get('lng') || params.get('longitude');
+
+                const coordsParam = params.get('coords');
+                if ((!lat || !lon) && coordsParam) {
+                    const parts = coordsParam.split(',').map((part) => part.trim());
+                    if (parts.length >= 2) {
+                        lat = lat || parts[0];
+                        lon = lon || parts[1];
                     }
-                } catch (err) {
-                    // Cross-origin restrictions - that's OK, frame will still work
-                    console.log('Cannot access frame content (CORS), but map should still work');
                 }
+
+                const parsedLat = Number(lat);
+                const parsedLon = Number(lon);
+                if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLon)) {
+                    return null;
+                }
+
+                if (Math.abs(parsedLat) > 90 || Math.abs(parsedLon) > 180) {
+                    return null;
+                }
+
+                return { lat: parsedLat, lon: parsedLon };
+            }
+
+            async fetchJSON(url) {
+                const response = await fetch(url, { credentials: 'same-origin' });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} for ${url}`);
+                }
+                return await response.json();
+            }
+
+            async enrichPlace(place) {
+                if (!place || !place.id) {
+                    return null;
+                }
+
+                if (place.location_hierarchy) {
+                    return place;
+                }
+
+                try {
+                    const details = await this.fetchJSON(`/apikey/v1/locations/places/details/place/${encodeURIComponent(place.id)}`);
+                    if (details && details.place) {
+                        return details.place;
+                    }
+                } catch (error) {
+                    console.warn('Place details lookup failed:', error.message);
+                }
+
+                return place;
+            }
+
+            async lookupPlaceByName(placeName) {
+                try {
+                    const lookupUrl =
+                        `/apikey/v1/locations/places/autocomplete?name=${encodeURIComponent(placeName)}&limit=8&website-sort=true`;
+                    const data = await this.fetchJSON(lookupUrl);
+                    const candidates = Array.isArray(data && data.candidates) ? data.candidates : [];
+                    if (!candidates.length) {
+                        return null;
+                    }
+
+                    const target = this.normalizeText(placeName);
+                    const exactMatch = candidates.find((candidate) =>
+                        this.normalizeText(candidate && candidate.name) === target
+                    );
+
+                    return await this.enrichPlace(exactMatch || candidates[0]);
+                } catch (error) {
+                    console.warn('Place name lookup failed:', error.message);
+                    return null;
+                }
+            }
+
+            async lookupPlaceByCoordinates(coords) {
+                try {
+                    const coordinate = encodeURIComponent(`"${coords.lon},${coords.lat}"`);
+                    const filter = encodeURIComponent('type:place');
+                    const lookupUrl =
+                        `/apikey/v1/locations/places/search?coordinate=${coordinate}&filter=${filter}&radius=50000&website-sort=true`;
+                    const data = await this.fetchJSON(lookupUrl);
+                    if (!data || !data.place) {
+                        return null;
+                    }
+
+                    return await this.enrichPlace(data.place);
+                } catch (error) {
+                    console.warn('Coordinate lookup failed:', error.message);
+                    return null;
+                }
+            }
+
+            buildPathFromPlace(place) {
+                if (!place || !place.id) {
+                    return null;
+                }
+
+                const hierarchy = place.location_hierarchy || {};
+                const region = Array.isArray(hierarchy.region) ? hierarchy.region : [];
+
+                const countrySlug = this.slugify(region[0] && region[0].description ? region[0].description : 'Australia');
+                const regionState = region[1] && region[1].description ? region[1].description : '';
+                const stateSlug = this.slugify(regionState) || this.expandStateCode(place.state) || 'australia';
+                const districtSource =
+                    (hierarchy.public_district && hierarchy.public_district.description) ||
+                    (hierarchy.fire_district && hierarchy.fire_district.description) ||
+                    (hierarchy.marine_coast && hierarchy.marine_coast.description) ||
+                    (hierarchy.coast && hierarchy.coast.description) ||
+                    (Array.isArray(hierarchy.metropolitan) && hierarchy.metropolitan[0] && hierarchy.metropolitan[0].description) ||
+                    regionState;
+                const districtSlug = this.slugify(districtSource) || stateSlug;
+
+                const nameSlug = this.slugify(place.name || 'location');
+                let locationId = String(place.id || '').trim();
+                if (nameSlug && !locationId.toLowerCase().includes(`-${nameSlug}`)) {
+                    locationId = `${locationId}-${nameSlug}`;
+                }
+
+                if (!locationId) {
+                    return null;
+                }
+
+                return `${countrySlug}/${stateSlug}/${districtSlug}/${locationId}`;
+            }
+
+            async resolveLocationPath(params) {
+                const explicitPath = this.sanitizePath(params.get('path'));
+                if (explicitPath) {
+                    return explicitPath;
+                }
+
+                const placeName = (params.get('place') || params.get('name') || '').trim();
+                if (placeName) {
+                    const place = await this.lookupPlaceByName(placeName);
+                    const placePath = this.buildPathFromPlace(place);
+                    if (placePath) {
+                        return placePath;
+                    }
+                }
+
+                const coords = this.parseCoordinates(params);
+                if (coords) {
+                    const place = await this.lookupPlaceByCoordinates(coords);
+                    const placePath = this.buildPathFromPlace(place);
+                    if (placePath) {
+                        return placePath;
+                    }
+                }
+
+                return 'australia/victoria/central/o2594692629-ashburton';
+            }
+
+            parseRequestedZoom(value) {
+                if (value === null || value === undefined || String(value).trim() === '') {
+                    return null;
+                }
+
+                const parsed = Math.round(Number(value));
+                if (!Number.isFinite(parsed)) {
+                    return null;
+                }
+
+                return Math.max(0, Math.min(20, parsed));
+            }
+
+            parseAnimateMode(value) {
+                const normalized = this.normalizeText(value);
+                if (!normalized) {
+                    return 'native';
+                }
+
+                if (['throttle', 'throttled', 'step', 'stepped'].includes(normalized)) {
+                    return 'throttle';
+                }
+
+                return 'native';
+            }
+
+            parseAnimateInterval(value) {
+                if (value === null || value === undefined || String(value).trim() === '') {
+                    return 2000;
+                }
+
+                const parsed = Math.round(Number(value));
+                if (!Number.isFinite(parsed)) {
+                    return 2000;
+                }
+
+                return Math.max(500, Math.min(30000, parsed));
+            }
+
+            parseFrameSkip(value) {
+                if (value === null || value === undefined || String(value).trim() === '') {
+                    return 1;
+                }
+
+                const parsed = Math.round(Number(value));
+                if (!Number.isFinite(parsed)) {
+                    return 1;
+                }
+
+                return Math.max(1, Math.min(6, parsed));
+            }
+
+            setRequestedZoom(value) {
+                this.requestedZoom = Number.isFinite(value) ? value : null;
+                this.zoomActionsTaken = 0;
+                this.zoomSessionStartedAt = this.requestedZoom === null ? 0 : Date.now();
+                this.zoomPendingDirection = 0;
+                this.zoomPendingSince = 0;
+                this.zoomPendingFrom = null;
+                this.zoomLastActionAt = 0;
+                this.lastKnownZoom = null;
+                this.zoomVirtualLevel = this.zoomFallbackBase;
+            }
+
+            clearRequestedZoom() {
+                this.requestedZoom = null;
+                this.zoomActionsTaken = 0;
+                this.zoomSessionStartedAt = 0;
+                this.zoomPendingDirection = 0;
+                this.zoomPendingSince = 0;
+                this.zoomPendingFrom = null;
+                this.zoomVirtualLevel = this.zoomFallbackBase;
+            }
+
+            onFrameLoad() {
+                if (this.frameLoadHandled) {
+                    return;
+                }
+                this.frameLoadHandled = true;
+
+                if (this.frameSoftLoadTimer) {
+                    clearInterval(this.frameSoftLoadTimer);
+                    this.frameSoftLoadTimer = null;
+                }
+
+                console.log('BOM map loaded successfully');
                 
                 // Hide loading, show map
                 this.loading.style.display = 'none';
                 this.frame.style.display = 'block';
-                
+                this.notifyParent('loaded');
+
+                if (this.showFrameTime) {
+                    this.startFrameTimeOverlay();
+                } else {
+                    this.stopFrameTimeOverlay();
+                }
+
+                if (this.cleanupEnabled) {
+                    this.startCleanupLoop();
+                }
+
+                if (this.shouldUseThrottledAnimation()) {
+                    this.startThrottledAnimationLoop();
+                } else {
+                    this.stopThrottledAnimationLoop();
+                }
+
                 // Focus the frame for interactions
                 setTimeout(() => {
                     this.frame.focus();
@@ -164,49 +580,1630 @@
 
             onFrameError(message = 'Failed to load map') {
                 console.error('Frame error:', message);
+                if (this.cleanupTimer) {
+                    clearTimeout(this.cleanupTimer);
+                    this.cleanupTimer = null;
+                }
+                if (this.frameSoftLoadTimer) {
+                    clearInterval(this.frameSoftLoadTimer);
+                    this.frameSoftLoadTimer = null;
+                }
+                this.stopThrottledAnimationLoop();
+                this.stopFrameTimeOverlay();
+                this.stopViewMoreSuppression();
+                this.stopHoverSuppression();
                 this.loading.style.display = 'none';
                 this.error.style.display = 'block';
                 this.error.querySelector('p').textContent = message;
+                this.notifyParent('error', message);
             }
 
-            cleanupBOMPage(doc) {
+            startCleanupLoop() {
+                const runCleanup = () => {
+                    this.cleanupAttempts += 1;
+                    let mapRoot = null;
+
+                    try {
+                        const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
+                        if (!frameDoc || !frameDoc.body) {
+                            return;
+                        }
+
+                        mapRoot = this.findMapRoot(frameDoc);
+
+                        if (this.forceRain) {
+                            this.activateRainTab(frameDoc, mapRoot);
+                        }
+
+                        if (this.shouldPauseNativePlayback()) {
+                            this.pauseTimelinePlayback(frameDoc);
+                        }
+
+                        if (this.requestedZoom !== null) {
+                            this.applyRequestedZoom(frameDoc);
+                        }
+
+                        const mapFound = this.cleanupBOMPage(frameDoc, mapRoot);
+                        if (mapFound && !this.renderNotified) {
+                            this.notifyParent('rendered');
+                            this.renderNotified = true;
+                        }
+                    } catch (err) {
+                        // Cross-origin restrictions or early load state: keep retrying.
+                        console.log('Cleanup pass skipped:', err.message);
+                    }
+
+                    if (this.cleanupAttempts < this.maxCleanupAttempts) {
+                        this.cleanupTimer = setTimeout(runCleanup, 500);
+                    } else {
+                        this.cleanupTimer = null;
+                    }
+                };
+
+                runCleanup();
+            }
+
+            findMapRoot(doc) {
+                if (this.mapOnlyEnabled) {
+                    const viewportSelectors = [
+                        '.esri-view-root',
+                        '.mapboxgl-map',
+                        '.leaflet-container',
+                        '.ol-viewport',
+                        'canvas.mapboxgl-canvas'
+                    ];
+
+                    for (const selector of viewportSelectors) {
+                        const node = doc.querySelector(selector);
+                        if (!node) {
+                            continue;
+                        }
+
+                        const container = node.closest(
+                            '.esri-view-root, .mapboxgl-map, .leaflet-container, .ol-viewport, [class*="map-view"], [class*="map-canvas"]'
+                        );
+                        return container || node.parentElement || node;
+                    }
+                }
+
+                const selectors = [
+                    '[data-component="bom-spatial-map"]',
+                    '[class*="spatial-map"]',
+                    '[class*="weather-map"]',
+                    '.esri-view-root',
+                    '.esri-view',
+                    '.mapboxgl-map',
+                    '.leaflet-container',
+                    '.ol-viewport',
+                    'canvas.mapboxgl-canvas'
+                ];
+
+                for (const selector of selectors) {
+                    const node = doc.querySelector(selector);
+                    if (!node) {
+                        continue;
+                    }
+
+                    const container = node.closest('[class*="spatial-map"], [class*="weather-map"], [data-component], section, article, div');
+                    return container || node;
+                }
+
+                return null;
+            }
+
+            cleanupBOMPage(doc, mapRoot) {
                 try {
-                    // Hide navigation, footer, and other non-map elements
+                    if (this.mapOnlyEnabled) {
+                        this.applyMapOnlyStyles(doc);
+                    }
+
+                    // Hide obvious page chrome first.
                     const selectorsToHide = [
                         'header',
                         'nav',
-                        'footer', 
+                        'footer',
                         '.header',
                         '.navigation',
                         '.breadcrumb',
+                        '.region-header',
+                        '.region-footer',
                         '.bom-header',
                         '.bom-footer',
-                        '.bom-navigation'
+                        '.bom-navigation',
+                        '[data-component="C16_Breadcrumbs"]',
+                        '[data-component="C30_FooterFeature"]',
+                        '[data-component="C09_NearbyNews"]',
+                        '[data-component="C105_CsatSidePanel"]',
+                        '[data-component="C105_CsatModal"]'
                     ];
 
                     selectorsToHide.forEach(selector => {
                         const elements = doc.querySelectorAll(selector);
-                        elements.forEach(el => el.style.display = 'none');
+                        elements.forEach(el => el.style.setProperty('display', 'none', 'important'));
                     });
 
-                    // Focus on map container if found
-                    const mapContainer = doc.querySelector('[data-map]') || 
-                                       doc.querySelector('.map-container') ||
-                                       doc.querySelector('#map');
-                    
-                    if (mapContainer) {
-                        mapContainer.style.width = '100%';
-                        mapContainer.style.height = '100vh';
+                    doc.documentElement.style.setProperty('height', '100%', 'important');
+                    doc.body.style.setProperty('height', '100%', 'important');
+                    doc.body.style.setProperty('margin', '0', 'important');
+                    doc.body.style.setProperty('padding', '0', 'important');
+                    doc.body.style.setProperty('overflow', 'hidden', 'important');
+
+                    if (mapRoot && this.mapOnlyEnabled) {
+                        this.setupViewMoreSuppression(doc);
+                        this.isolateToNode(doc, mapRoot);
                     }
 
-                    // Remove page margins/padding
-                    doc.body.style.margin = '0';
-                    doc.body.style.padding = '0';
-                    doc.body.style.overflow = 'hidden';
+                    if (mapRoot && this.frame.contentWindow) {
+                        this.frame.contentWindow.dispatchEvent(new Event('resize'));
+                    }
 
+                    return Boolean(mapRoot);
                 } catch (err) {
                     console.warn('Could not clean up BOM page:', err);
+                    return false;
                 }
+            }
+
+            applyMapOnlyStyles(doc) {
+                const styleId = 'bom-map-only-style';
+                let style = doc.getElementById(styleId);
+                if (!style) {
+                    style = doc.createElement('style');
+                    style.id = styleId;
+                    doc.head.appendChild(style);
+                }
+
+                const hideTimelineForAutomation = this.shouldUseThrottledAnimation();
+                const timelineSelectors = `
+                    [class*="timeslider"],
+                    [class*="time-slider"],
+                    [class*="timeline"],
+                    [class*="time-label"],
+                    [class*="playback"]
+                `;
+                const timelineRule = hideTimelineForAutomation
+                    ? `
+                    ${timelineSelectors} {
+                        opacity: 0 !important;
+                        visibility: hidden !important;
+                        pointer-events: none !important;
+                    }
+                `
+                    : `
+                    ${timelineSelectors} {
+                        display: none !important;
+                    }
+                `;
+
+                style.textContent = `
+                    html, body {
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        width: 100% !important;
+                        height: 100% !important;
+                        overflow: hidden !important;
+                        background: #000 !important;
+                    }
+
+                    #drupal-location-placeholder,
+                    .preloader,
+                    [role="tablist"],
+                    [role="tab"],
+                    .tabs,
+                    .tablist,
+                    [class*="tab-list"],
+                    [class*="quick-link"],
+                    [class*="quickLinks"],
+                    [class*="legend"],
+                    [class*="footer"],
+                    [class*="attribution"],
+                    [class*="copyright"],
+                    h1, h2, h3, h4, h5, h6,
+                    .esri-attribution,
+                    .esri-attribution__powered-by,
+                    .esri-scale-bar,
+                    .esri-popup,
+                    .esri-popup__main-container,
+                    .esri-popup__content,
+                    .esri-popup__footer,
+                    .esri-popup__button,
+                    .esri-popup__header,
+                    .esri-features,
+                    .esri-feature,
+                    .esri-callout,
+                    [role="tooltip"],
+                    [class*="tooltip"],
+                    [class*="popover"],
+                    [class*="view-more"][class*="location"] {
+                        display: none !important;
+                    }
+
+                    .esri-view-root a[href*="/location/"],
+                    .esri-view-root a[href*="www.bom.gov.au/location/"],
+                    .esri-popup a {
+                        pointer-events: none !important;
+                        cursor: default !important;
+                        text-decoration: none !important;
+                    }
+
+                    .esri-view-root,
+                    .esri-view,
+                    .esri-view-surface,
+                    .mapboxgl-map,
+                    .leaflet-container,
+                    .ol-viewport {
+                        width: 100% !important;
+                        height: 100% !important;
+                        min-height: 100% !important;
+                        max-height: 100% !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                    }
+
+                    ${timelineRule}
+                `;
+            }
+
+            setupViewMoreSuppression(doc) {
+                const blockedPhrases = [
+                    'view more at this location',
+                    'view more',
+                    'at this location'
+                ];
+
+                const hideViewMoreElements = () => {
+                    const popupContainers = Array.from(
+                        doc.querySelectorAll(
+                            '.esri-popup, .esri-features, [role="dialog"], [role="tooltip"], [class*="popup"], [class*="callout"], [class*="tooltip"], [class*="popover"]'
+                        )
+                    );
+                    for (const container of popupContainers) {
+                        container.style.setProperty('display', 'none', 'important');
+                        container.style.setProperty('visibility', 'hidden', 'important');
+                        container.style.setProperty('pointer-events', 'none', 'important');
+                    }
+
+                    const candidates = Array.from(
+                        doc.querySelectorAll('.esri-popup, [role="dialog"], [class*="popup"], [class*="callout"], a, button, div, span, p')
+                    );
+
+                    for (const node of candidates) {
+                        if (!node || !node.textContent) {
+                            continue;
+                        }
+
+                        const text = this.normalizeText(node.textContent);
+                        if (!blockedPhrases.some((phrase) => text.includes(phrase))) {
+                            continue;
+                        }
+
+                        const popupHost = node.closest('.esri-popup, [role="dialog"], [class*="popup"], [class*="callout"]');
+                        const target = popupHost || node;
+                        target.style.setProperty('display', 'none', 'important');
+                        target.style.setProperty('visibility', 'hidden', 'important');
+                        target.style.setProperty('pointer-events', 'none', 'important');
+                    }
+
+                    const locationLinks = Array.from(doc.querySelectorAll('a[href*="/location/"], a[href*="www.bom.gov.au/location/"]'));
+                    for (const link of locationLinks) {
+                        if (link.hasAttribute('href') && !link.hasAttribute('data-disabled-href')) {
+                            link.setAttribute('data-disabled-href', link.getAttribute('href') || '');
+                        }
+                        link.removeAttribute('href');
+                        link.style.setProperty('pointer-events', 'none', 'important');
+                        link.style.setProperty('cursor', 'default', 'important');
+                        link.style.setProperty('text-decoration', 'none', 'important');
+                    }
+                };
+
+                hideViewMoreElements();
+
+                if (this.viewMoreObserver) {
+                    this.viewMoreObserver.disconnect();
+                }
+
+                let suppressionQueued = false;
+                this.viewMoreObserver = new MutationObserver(() => {
+                    if (suppressionQueued) {
+                        return;
+                    }
+                    suppressionQueued = true;
+                    setTimeout(() => {
+                        suppressionQueued = false;
+                        hideViewMoreElements();
+                    }, 250);
+                });
+
+                this.viewMoreObserver.observe(doc.body, {
+                    childList: true,
+                    subtree: true
+                });
+            }
+
+            setupHoverSuppression(doc) {
+                if (this.hoverSuppressionCleanup) {
+                    return;
+                }
+
+                const isControlTarget = (target) => {
+                    if (!target || typeof target.closest !== 'function') {
+                        return false;
+                    }
+
+                    return Boolean(
+                        target.closest(
+                            '.esri-zoom, .esri-widget--button, button, [role="button"], [role="slider"]'
+                        )
+                    );
+                };
+
+                const isMapContext = (target) => {
+                    if (!target || typeof target.closest !== 'function') {
+                        return false;
+                    }
+
+                    return Boolean(
+                        target.closest(
+                            '.esri-view-root, .esri-view, .esri-view-surface, .mapboxgl-map, .leaflet-container, .ol-viewport, .esri-popup, .esri-features, [role="tooltip"], [class*="popup"], [class*="tooltip"], [class*="callout"], [class*="popover"]'
+                        )
+                    );
+                };
+
+                const blockHover = (event) => {
+                    const target = event && event.target;
+                    if (!isMapContext(target)) {
+                        return;
+                    }
+
+                    if (isControlTarget(target)) {
+                        return;
+                    }
+
+                    const buttons = typeof event.buttons === 'number' ? event.buttons : 0;
+                    if (buttons > 0) {
+                        return;
+                    }
+
+                    event.stopImmediatePropagation();
+                    event.stopPropagation();
+                };
+
+                const eventTypes = ['pointermove', 'mousemove', 'mouseover', 'mouseenter'];
+                for (const type of eventTypes) {
+                    doc.addEventListener(type, blockHover, true);
+                }
+
+                this.hoverSuppressionCleanup = () => {
+                    for (const type of eventTypes) {
+                        doc.removeEventListener(type, blockHover, true);
+                    }
+                };
+            }
+
+            stopHoverSuppression() {
+                if (typeof this.hoverSuppressionCleanup === 'function') {
+                    this.hoverSuppressionCleanup();
+                }
+                this.hoverSuppressionCleanup = null;
+            }
+
+            stopViewMoreSuppression() {
+                if (this.viewMoreObserver) {
+                    this.viewMoreObserver.disconnect();
+                    this.viewMoreObserver = null;
+                }
+                this.stopHoverSuppression();
+            }
+
+            startFrameTimeOverlay() {
+                if (!this.frameTimeOverlay) {
+                    const badge = document.createElement('div');
+                    badge.id = 'frameTimeOverlay';
+                    badge.style.position = 'absolute';
+                    badge.style.bottom = '12px';
+                    badge.style.right = '12px';
+                    badge.style.zIndex = '120';
+                    badge.style.padding = '6px 10px';
+                    badge.style.borderRadius = '6px';
+                    badge.style.background = 'rgba(0, 0, 0, 0.65)';
+                    badge.style.color = '#fff';
+                    badge.style.font = '600 13px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif';
+                    badge.style.letterSpacing = '0.2px';
+                    badge.textContent = '--';
+                    this.frameTimeOverlay = badge;
+                    this.frame.parentElement.appendChild(badge);
+                }
+
+                if (this.frameTimeTimer) {
+                    clearInterval(this.frameTimeTimer);
+                }
+
+                this.updateFrameTimeOverlay();
+                this.frameTimeTimer = setInterval(() => this.updateFrameTimeOverlay(), this.frameTimeIntervalMs);
+            }
+
+            stopFrameTimeOverlay() {
+                if (this.frameTimeTimer) {
+                    clearInterval(this.frameTimeTimer);
+                    this.frameTimeTimer = null;
+                }
+                if (this.frameTimeOverlay && this.frameTimeOverlay.parentNode) {
+                    this.frameTimeOverlay.parentNode.removeChild(this.frameTimeOverlay);
+                }
+                this.frameTimeOverlay = null;
+            }
+
+            extractFrameTimestamp(url) {
+                const decoded = decodeURIComponent(String(url || ''));
+                const match = decoded.match(/\/default\/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)\//);
+                return match ? match[1] : null;
+            }
+
+            formatFrameTimestamp(timestamp) {
+                const parsed = new Date(timestamp);
+                if (Number.isNaN(parsed.getTime())) {
+                    return timestamp;
+                }
+
+                const localText = parsed.toLocaleString([], {
+                    weekday: 'short',
+                    month: 'short',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+
+                return `${localText}`;
+            }
+
+            abbreviateWeekdayLabel(label) {
+                const text = String(label || '').trim();
+                if (!text) {
+                    return text;
+                }
+
+                const weekdayMap = {
+                    monday: 'Mon',
+                    tuesday: 'Tue',
+                    wednesday: 'Wed',
+                    thursday: 'Thu',
+                    friday: 'Fri',
+                    saturday: 'Sat',
+                    sunday: 'Sun'
+                };
+
+                return text.replace(
+                    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/ig,
+                    (match) => weekdayMap[match.toLowerCase()] || match
+                );
+            }
+
+            parseFramePositionFromSliderNode(node) {
+                if (!node) {
+                    return null;
+                }
+
+                const parseAttr = (name) => {
+                    const value = node.getAttribute ? node.getAttribute(name) : null;
+                    const parsed = Number(value);
+                    return Number.isFinite(parsed) ? parsed : null;
+                };
+
+                let rawMin = parseAttr('aria-valuemin');
+                let rawMax = parseAttr('aria-valuemax');
+                let rawNow = parseAttr('aria-valuenow');
+
+                if (node.tagName === 'INPUT' && String(node.type || '').toLowerCase() === 'range') {
+                    const inputMin = Number(node.min);
+                    const inputMax = Number(node.max);
+                    const inputNow = Number(node.value);
+                    rawMin = Number.isFinite(rawMin) ? rawMin : (Number.isFinite(inputMin) ? inputMin : rawMin);
+                    rawMax = Number.isFinite(rawMax) ? rawMax : (Number.isFinite(inputMax) ? inputMax : rawMax);
+                    rawNow = Number.isFinite(rawNow) ? rawNow : (Number.isFinite(inputNow) ? inputNow : rawNow);
+                }
+
+                if (!Number.isFinite(rawMax) || !Number.isFinite(rawNow)) {
+                    return null;
+                }
+
+                const minValue = Number.isFinite(rawMin) ? rawMin : 0;
+                const current = Math.round(rawNow - minValue + 1);
+                const total = Math.round(rawMax - minValue + 1);
+                if (!Number.isFinite(current) || !Number.isFinite(total) || total < 2 || current < 1 || current > total) {
+                    return null;
+                }
+
+                const descriptor = this.normalizeText(
+                    [
+                        node.getAttribute ? node.getAttribute('aria-label') : '',
+                        node.getAttribute ? node.getAttribute('title') : '',
+                        node.className,
+                        node.id
+                    ].filter(Boolean).join(' ')
+                );
+                const hasTimelineToken = /(time|timeline|playback|scrubber|frame|radar)/.test(descriptor);
+                const hasZoomToken = /\bzoom\b/.test(descriptor);
+
+                let score = 0;
+                if (hasTimelineToken) {
+                    score += 6;
+                }
+                if (total >= 2 && total <= 24) {
+                    score += 3;
+                } else if (total <= 60) {
+                    score += 1;
+                }
+                if (current <= total) {
+                    score += 1;
+                }
+                if (hasZoomToken) {
+                    score -= 8;
+                }
+
+                return {
+                    current,
+                    total,
+                    score,
+                    minValue,
+                    maxValue: rawMax,
+                    nowValue: rawNow,
+                    descriptor,
+                    hasTimelineToken,
+                    hasZoomToken
+                };
+            }
+
+            extractFramePositionFromDOM(doc) {
+                if (!doc) {
+                    return null;
+                }
+
+                const candidates = Array.from(
+                    doc.querySelectorAll(
+                        '[role="slider"], input[type="range"], [aria-valuenow][aria-valuemax]'
+                    )
+                );
+
+                let best = null;
+                for (const node of candidates) {
+                    const parsed = this.parseFramePositionFromSliderNode(node);
+                    if (!parsed) {
+                        continue;
+                    }
+
+                    if (!best || parsed.score > best.score) {
+                        best = parsed;
+                    }
+                }
+
+                if (!best) {
+                    return null;
+                }
+
+                return {
+                    current: best.current,
+                    total: best.total
+                };
+            }
+
+            extractFramePositionFromEntries(frameEntries) {
+                if (!Array.isArray(frameEntries) || frameEntries.length < 2) {
+                    return null;
+                }
+
+                const latest = frameEntries[frameEntries.length - 1];
+                if (!latest || !latest.timestamp) {
+                    return null;
+                }
+
+                const unique = [];
+                const seen = new Set();
+                for (const item of frameEntries) {
+                    if (!item || !item.timestamp || seen.has(item.timestamp)) {
+                        continue;
+                    }
+                    seen.add(item.timestamp);
+                    unique.push(item.timestamp);
+                }
+
+                if (unique.length < 2) {
+                    return null;
+                }
+
+                const latestIndex = unique.lastIndexOf(latest.timestamp);
+                if (latestIndex < 0) {
+                    return null;
+                }
+
+                return {
+                    current: latestIndex + 1,
+                    total: unique.length
+                };
+            }
+
+            composeFrameOverlayLabel(baseLabel, framePosition) {
+                const labelText = this.abbreviateWeekdayLabel(String(baseLabel || '').trim());
+                const hasFramePosition =
+                    framePosition &&
+                    Number.isFinite(framePosition.current) &&
+                    Number.isFinite(framePosition.total) &&
+                    framePosition.total > 1;
+
+                if (!labelText && !hasFramePosition) {
+                    return null;
+                }
+
+                if (!hasFramePosition) {
+                    return labelText;
+                }
+
+                const frameText = `${framePosition.current}/${framePosition.total}`;
+                return labelText ? `${labelText} ${frameText}` : frameText;
+            }
+
+            collectResourceEntries() {
+                const entries = [];
+                const appendRecent = (sourceEntries) => {
+                    if (!Array.isArray(sourceEntries) || !sourceEntries.length) {
+                        return;
+                    }
+                    const maxEntries = 600;
+                    const startIndex = Math.max(0, sourceEntries.length - maxEntries);
+                    entries.push(...sourceEntries.slice(startIndex));
+                };
+
+                try {
+                    appendRecent(window.performance.getEntriesByType('resource'));
+                } catch (error) {
+                    // ignore
+                }
+
+                try {
+                    if (this.frame && this.frame.contentWindow) {
+                        appendRecent(this.frame.contentWindow.performance.getEntriesByType('resource'));
+                    }
+                } catch (error) {
+                    // ignore
+                }
+
+                return entries;
+            }
+
+            extractZoomEntries() {
+                const zoomPatterns = [
+                    /\/GoogleMapsCompatible[^/]*\/(\d+)\/\d+\/\d+\.(?:png|jpg|jpeg|webp)/i,
+                    /\/tile\/(\d+)\/\d+\/\d+\.(?:png|jpg|jpeg|webp)/i,
+                    /\/wmts\/1\.0\.0\/[^/]+\/default\/[^/]+\/[^/]+\/(\d+)\/\d+\/\d+\.(?:png|jpg|jpeg|webp)/i
+                ];
+                const zoomEntries = this.collectResourceEntries()
+                    .map((entry) => {
+                        const url = String(entry && entry.name ? entry.name : '');
+                        let match = null;
+                        for (const pattern of zoomPatterns) {
+                            match = url.match(pattern);
+                            if (match) {
+                                break;
+                            }
+                        }
+                        return {
+                            time: entry && typeof entry.startTime === 'number' ? entry.startTime : 0,
+                            zoom: match ? Number(match[1]) : NaN
+                        };
+                    })
+                    .filter((item) => Number.isFinite(item.zoom));
+
+                zoomEntries.sort((a, b) => a.time - b.time);
+                return zoomEntries;
+            }
+
+            extractCurrentZoomLevel() {
+                const zoomEntries = this.extractZoomEntries();
+                if (!zoomEntries.length) {
+                    return null;
+                }
+
+                const latestTime = zoomEntries[zoomEntries.length - 1].time;
+                const cutoff = latestTime - 4000;
+                const recentEntries = zoomEntries.filter((entry) => entry.time >= cutoff);
+                const counts = new Map();
+
+                for (const entry of recentEntries) {
+                    const previous = counts.get(entry.zoom) || { count: 0, lastTime: 0 };
+                    counts.set(entry.zoom, {
+                        count: previous.count + 1,
+                        lastTime: Math.max(previous.lastTime, entry.time)
+                    });
+                }
+
+                let bestZoom = null;
+                let bestCount = -1;
+                let bestLastTime = -1;
+                for (const [zoom, stats] of counts.entries()) {
+                    if (
+                        stats.count > bestCount ||
+                        (stats.count === bestCount && stats.lastTime > bestLastTime)
+                    ) {
+                        bestZoom = zoom;
+                        bestCount = stats.count;
+                        bestLastTime = stats.lastTime;
+                    }
+                }
+
+                return Number.isFinite(bestZoom)
+                    ? bestZoom
+                    : zoomEntries[zoomEntries.length - 1].zoom;
+            }
+
+            isElementVisible(element) {
+                if (!element) {
+                    return false;
+                }
+
+                const style = element.ownerDocument && element.ownerDocument.defaultView
+                    ? element.ownerDocument.defaultView.getComputedStyle(element)
+                    : null;
+
+                if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) {
+                    return false;
+                }
+
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+
+            findZoomControlButton(doc, direction) {
+                const zoomIn = direction > 0;
+                const selectors = zoomIn
+                    ? [
+                        '.esri-zoom__in-button',
+                        '.esri-zoom .esri-widget--button'
+                    ]
+                    : [
+                        '.esri-zoom__out-button',
+                        '.esri-zoom .esri-widget--button'
+                    ];
+
+                for (const selector of selectors) {
+                    let candidate = null;
+                    try {
+                        candidate = doc.querySelector(selector);
+                    } catch (error) {
+                        continue;
+                    }
+                    if (!candidate || !this.isElementVisible(candidate)) {
+                        continue;
+                    }
+                    const label = this.normalizeText(
+                        candidate.getAttribute('aria-label') ||
+                        candidate.getAttribute('title') ||
+                        candidate.textContent
+                    );
+                    const expectedLabel = zoomIn ? 'zoom in' : 'zoom out';
+                    const expectedSymbol = zoomIn ? '+' : '-';
+                    if (!label.includes(expectedLabel) && !label.includes(expectedSymbol)) {
+                        continue;
+                    }
+                    if (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true') {
+                        continue;
+                    }
+                    return candidate;
+                }
+
+                const textCandidates = Array.from(doc.querySelectorAll('.esri-zoom button, button, [role="button"]'));
+                for (const candidate of textCandidates) {
+                    if (!this.isElementVisible(candidate)) {
+                        continue;
+                    }
+
+                    const label = this.normalizeText(
+                        candidate.getAttribute('aria-label') ||
+                        candidate.getAttribute('title') ||
+                        candidate.textContent
+                    );
+                    if (!label) {
+                        continue;
+                    }
+
+                    const expected = zoomIn ? ['zoom in', '+'] : ['zoom out', '-'];
+                    if (expected.some((token) => label.includes(token))) {
+                        return candidate;
+                    }
+                }
+
+                return null;
+            }
+
+            activateZoomControl(control, doc) {
+                if (!control) {
+                    return false;
+                }
+
+                if (typeof control.focus === 'function') {
+                    control.focus();
+                }
+
+                try {
+                    const view = doc && doc.defaultView ? doc.defaultView : window;
+                    const rect = control.getBoundingClientRect();
+                    const clientX = Math.round(rect.left + rect.width / 2);
+                    const clientY = Math.round(rect.top + rect.height / 2);
+
+                    control.dispatchEvent(new MouseEvent('mousedown', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    control.dispatchEvent(new MouseEvent('mouseup', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    control.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    return true;
+                } catch (error) {
+                    return false;
+                }
+            }
+
+            findMapInteractionTarget(doc) {
+                const targetSelectors = [
+                    '.esri-view-surface canvas',
+                    '.esri-view-surface',
+                    '.esri-view-root',
+                    '.mapboxgl-canvas',
+                    '.mapboxgl-map',
+                    '.leaflet-container',
+                    '.ol-viewport'
+                ];
+
+                for (const selector of targetSelectors) {
+                    const node = doc.querySelector(selector);
+                    if (node) {
+                        return node;
+                    }
+                }
+
+                return null;
+            }
+
+            dispatchZoomGesture(doc, target, direction) {
+                const rect = target.getBoundingClientRect();
+                const clientX = Math.round(rect.left + rect.width / 2);
+                const clientY = Math.round(rect.top + rect.height / 2);
+                const view = doc.defaultView;
+                const zoomIn = direction > 0;
+
+                target.dispatchEvent(new MouseEvent('dblclick', {
+                    bubbles: true,
+                    cancelable: true,
+                    clientX,
+                    clientY,
+                    shiftKey: !zoomIn,
+                    view
+                }));
+
+                target.dispatchEvent(new WheelEvent('wheel', {
+                    bubbles: true,
+                    cancelable: true,
+                    clientX,
+                    clientY,
+                    deltaY: zoomIn ? -240 : 240,
+                    deltaX: 0,
+                    deltaMode: 0,
+                    view
+                }));
+
+                doc.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: zoomIn ? '+' : '-',
+                    code: zoomIn ? 'Equal' : 'Minus',
+                    bubbles: true,
+                    cancelable: true,
+                    shiftKey: zoomIn,
+                    view
+                }));
+            }
+
+            applyRequestedZoom(doc) {
+                if (this.requestedZoom === null) {
+                    return;
+                }
+
+                const now = Date.now();
+                if (!this.zoomSessionStartedAt) {
+                    this.zoomSessionStartedAt = now;
+                }
+
+                if (
+                    this.zoomActionsTaken >= this.zoomMaxActions ||
+                    now - this.zoomSessionStartedAt > this.zoomSessionMaxDurationMs
+                ) {
+                    console.warn('Requested zoom session ended before target was reached', {
+                        target: this.requestedZoom,
+                        lastKnownZoom: this.lastKnownZoom,
+                        actions: this.zoomActionsTaken
+                    });
+                    this.clearRequestedZoom();
+                    return;
+                }
+
+                const currentZoom = this.extractCurrentZoomLevel();
+                if (Number.isFinite(currentZoom)) {
+                    this.lastKnownZoom = currentZoom;
+                    this.zoomVirtualLevel = currentZoom;
+                }
+
+                const observedZoom = Number.isFinite(currentZoom) ? currentZoom : this.lastKnownZoom;
+                if (Number.isFinite(observedZoom) && observedZoom === this.requestedZoom) {
+                    this.clearRequestedZoom();
+                    return;
+                }
+
+                if (this.zoomPendingDirection !== 0) {
+                    const elapsed = now - this.zoomPendingSince;
+
+                    if (Number.isFinite(observedZoom) && Number.isFinite(this.zoomPendingFrom)) {
+                        const movedInExpectedDirection =
+                            this.zoomPendingDirection > 0
+                                ? observedZoom > this.zoomPendingFrom
+                                : observedZoom < this.zoomPendingFrom;
+
+                        if (movedInExpectedDirection) {
+                            this.zoomPendingDirection = 0;
+                            this.zoomPendingSince = 0;
+                            this.zoomPendingFrom = null;
+                            if (observedZoom === this.requestedZoom) {
+                                this.clearRequestedZoom();
+                                return;
+                            }
+                        } else if (elapsed < this.zoomWaitForChangeMs) {
+                            return;
+                        } else {
+                            this.zoomPendingDirection = 0;
+                            this.zoomPendingSince = 0;
+                        }
+                    } else if (elapsed < this.zoomWaitForChangeMs) {
+                        return;
+                    } else {
+                        this.zoomPendingDirection = 0;
+                        this.zoomPendingSince = 0;
+                    }
+                }
+
+                let baseline = Number.isFinite(observedZoom) ? observedZoom : this.zoomVirtualLevel;
+                if (!Number.isFinite(baseline)) {
+                    baseline = this.zoomFallbackBase;
+                }
+
+                const delta = this.requestedZoom - baseline;
+                if (delta === 0) {
+                    this.clearRequestedZoom();
+                    return;
+                }
+
+                if (now - this.zoomLastActionAt < this.zoomActionIntervalMs) {
+                    return;
+                }
+
+                const direction = delta > 0 ? 1 : -1;
+                let actionApplied = false;
+                const zoomControl = this.findZoomControlButton(doc, direction);
+                if (zoomControl && this.activateZoomControl(zoomControl, doc)) {
+                    actionApplied = true;
+                }
+
+                if (!actionApplied) {
+                    const target = this.findMapInteractionTarget(doc);
+                    if (target) {
+                        if (typeof target.focus === 'function') {
+                            target.focus();
+                        }
+                        this.dispatchZoomGesture(doc, target, direction);
+                        actionApplied = true;
+                    }
+                }
+
+                if (!actionApplied) {
+                    return;
+                }
+
+                this.zoomLastActionAt = now;
+                this.zoomActionsTaken += 1;
+                this.zoomPendingDirection = direction;
+                this.zoomPendingSince = now;
+                this.zoomPendingFrom = baseline;
+                if (!Number.isFinite(observedZoom)) {
+                    this.zoomVirtualLevel = Math.max(0, Math.min(20, baseline + direction));
+                }
+            }
+
+            extractFrameLabelFromDOM(doc) {
+                if (!doc) {
+                    return null;
+                }
+
+                const candidates = Array.from(
+                    doc.querySelectorAll(
+                        '[class*="time"], [class*="timeline"], [class*="slider"], [aria-live], [data-testid*="time"]'
+                    )
+                );
+
+                const patterns = [
+                    /\b(?:mon|tue|wed|thu|fri|sat|sun)\w*\s+\d{1,2}\s+\w{3},?\s+\d{1,2}:\d{2}\s*(?:am|pm)\b/i,
+                    /\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i
+                ];
+
+                for (const candidate of candidates) {
+                    const text = String(candidate.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!text) {
+                        continue;
+                    }
+
+                    for (const pattern of patterns) {
+                        const match = text.match(pattern);
+                        if (match && match[0]) {
+                            return match[0];
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            updateFrameTimeOverlay() {
+                if (!this.frameTimeOverlay || !this.frame || !this.frame.contentWindow) {
+                    return;
+                }
+
+                try {
+                    const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
+                    const domLabel = this.extractFrameLabelFromDOM(frameDoc);
+                    let framePosition = this.extractFramePositionFromDOM(frameDoc);
+                    let fallbackLabel = null;
+                    if (!domLabel || !framePosition) {
+                        const frameEntries = this.collectResourceEntries()
+                            .filter((entry) => entry && entry.name && entry.name.includes('/wmts/1.0.0/'))
+                            .map((entry) => ({
+                                time: entry.startTime || 0,
+                                timestamp: this.extractFrameTimestamp(entry.name)
+                            }))
+                            .filter((item) => Boolean(item.timestamp));
+
+                        if (frameEntries.length) {
+                            frameEntries.sort((a, b) => a.time - b.time);
+                            const latest = frameEntries[frameEntries.length - 1].timestamp;
+                            fallbackLabel = this.formatFrameTimestamp(latest);
+                            if (!framePosition) {
+                                framePosition = this.extractFramePositionFromEntries(frameEntries);
+                            }
+                        }
+                    }
+
+                    const overlayLabel = this.composeFrameOverlayLabel(domLabel || fallbackLabel, framePosition);
+                    if (overlayLabel) {
+                        this.frameTimeOverlay.textContent = overlayLabel;
+                    }
+                } catch (error) {
+                    // Same-origin access may briefly fail during navigation. Ignore and retry.
+                }
+            }
+
+            isolateToNode(doc, focusNode) {
+                const keepPath = new Set();
+                let current = focusNode;
+
+                while (current) {
+                    keepPath.add(current);
+                    if (current === doc.body) {
+                        break;
+                    }
+                    current = current.parentElement;
+                }
+
+                Array.from(doc.body.children).forEach(child => {
+                    if (!keepPath.has(child)) {
+                        child.style.setProperty('display', 'none', 'important');
+                    }
+                });
+
+                current = focusNode;
+                while (current && current !== doc.body) {
+                    const parent = current.parentElement;
+                    if (!parent) {
+                        break;
+                    }
+
+                    Array.from(parent.children).forEach(sibling => {
+                        if (sibling === current || sibling.tagName === 'SCRIPT' || sibling.tagName === 'STYLE') {
+                            return;
+                        }
+                        sibling.style.setProperty('display', 'none', 'important');
+                    });
+
+                    current = parent;
+                }
+
+                this.expandToViewport(doc, focusNode);
+            }
+
+            expandToViewport(doc, focusNode) {
+                let current = focusNode;
+                while (current) {
+                    current.style.setProperty('width', '100%', 'important');
+                    current.style.setProperty('max-width', '100%', 'important');
+                    if (this.mapOnlyEnabled) {
+                        current.style.setProperty('height', '100%', 'important');
+                        current.style.setProperty('min-height', '100%', 'important');
+                        current.style.setProperty('margin', '0', 'important');
+                        current.style.setProperty('padding', '0', 'important');
+                    }
+                    if (current === focusNode) {
+                        current.style.setProperty('height', '100%', 'important');
+                        current.style.setProperty('min-height', '100vh', 'important');
+                    }
+                    if (current === doc.body) {
+                        break;
+                    }
+                    current = current.parentElement;
+                }
+            }
+
+            normalizeText(value) {
+                return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            }
+
+            shouldUseThrottledAnimation() {
+                return this.animate && this.animateMode === 'throttle';
+            }
+
+            shouldPauseNativePlayback() {
+                return !this.animate || this.shouldUseThrottledAnimation();
+            }
+
+            startThrottledAnimationLoop() {
+                this.stopThrottledAnimationLoop();
+
+                if (!this.shouldUseThrottledAnimation()) {
+                    return;
+                }
+
+                const tick = () => {
+                    if (!this.shouldUseThrottledAnimation()) {
+                        this.stopThrottledAnimationLoop();
+                        return;
+                    }
+
+                    try {
+                        const frameDoc = this.frame.contentDocument || (this.frame.contentWindow && this.frame.contentWindow.document);
+                        if (!frameDoc || !frameDoc.body) {
+                            return;
+                        }
+
+                        this.pauseTimelinePlayback(frameDoc);
+                        this.maybeAdvanceThrottledFrame(frameDoc);
+                    } catch (error) {
+                        // Ignore occasional iframe access errors while map state changes.
+                    }
+                };
+
+                this.throttledAnimationTimer = setInterval(tick, this.animateIntervalMs);
+                setTimeout(tick, Math.min(900, this.animateIntervalMs));
+            }
+
+            stopThrottledAnimationLoop() {
+                if (this.throttledAnimationTimer) {
+                    clearInterval(this.throttledAnimationTimer);
+                    this.throttledAnimationTimer = null;
+                }
+            }
+
+            maybeAdvanceThrottledFrame(doc) {
+                const now = Date.now();
+                if (now - this.lastThrottledAnimationAt < this.animateIntervalMs) {
+                    return false;
+                }
+
+                let moved = this.advanceTimelineBySteps(doc, this.frameSkip);
+                if (!moved) {
+                    moved = this.pulseTimelinePlayback(doc);
+                }
+
+                if (moved) {
+                    this.lastThrottledAnimationAt = now;
+                }
+                return moved;
+            }
+
+            advanceTimelineBySteps(doc, steps) {
+                const count = Math.max(1, Math.min(6, Math.round(Number(steps) || 1)));
+                let moved = false;
+
+                for (let index = 0; index < count; index += 1) {
+                    if (this.clickTimelineStepButton(doc, 1)) {
+                        moved = true;
+                        continue;
+                    }
+
+                    if (this.moveTimelineSlider(doc, 1)) {
+                        moved = true;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                return moved;
+            }
+
+            pulseTimelinePlayback(doc) {
+                const playControl = this.findPlaybackControl(doc, 'play');
+                if (!playControl) {
+                    return false;
+                }
+
+                this.playbackPaused = false;
+                if (typeof playControl.focus === 'function') {
+                    playControl.focus();
+                }
+                if (typeof playControl.click === 'function') {
+                    playControl.click();
+                }
+
+                setTimeout(() => {
+                    try {
+                        this.pauseTimelinePlayback(doc);
+                    } catch (error) {
+                        // ignore
+                    }
+                }, Math.max(250, Math.min(900, Math.round(this.animateIntervalMs * 0.35))));
+
+                return true;
+            }
+
+            clickTimelineStepButton(doc, direction) {
+                const control = this.findTimelineStepControl(doc, direction);
+                if (!control) {
+                    return false;
+                }
+
+                if (typeof control.focus === 'function') {
+                    control.focus();
+                }
+
+                try {
+                    const view = doc && doc.defaultView ? doc.defaultView : window;
+                    const rect = control.getBoundingClientRect();
+                    const clientX = Math.round(rect.left + rect.width / 2);
+                    const clientY = Math.round(rect.top + rect.height / 2);
+
+                    control.dispatchEvent(new MouseEvent('mousedown', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    control.dispatchEvent(new MouseEvent('mouseup', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    control.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        clientX,
+                        clientY,
+                        button: 0,
+                        view
+                    }));
+                    return true;
+                } catch (error) {
+                    if (typeof control.click === 'function') {
+                        control.click();
+                        return true;
+                    }
+                    return false;
+                }
+            }
+
+            findTimelineStepControl(doc, direction) {
+                const isNext = direction >= 0;
+                const selectors = [
+                    '[aria-label]',
+                    '[title]',
+                    'button',
+                    '[role="button"]'
+                ];
+                const directionalTokens = isNext
+                    ? ['next', 'forward', 'ahead', 'later', 'newer']
+                    : ['prev', 'previous', 'back', 'earlier', 'older'];
+
+                for (const selector of selectors) {
+                    let candidates = [];
+                    try {
+                        candidates = Array.from(doc.querySelectorAll(selector));
+                    } catch (error) {
+                        continue;
+                    }
+
+                    for (const candidate of candidates) {
+                        if (
+                            candidate.hasAttribute('disabled') ||
+                            candidate.getAttribute('aria-disabled') === 'true'
+                        ) {
+                            continue;
+                        }
+
+                        const label = this.normalizeText(
+                            candidate.getAttribute('aria-label') ||
+                            candidate.getAttribute('title') ||
+                            candidate.textContent
+                        );
+                        if (!label) {
+                            continue;
+                        }
+
+                        const timelineContext = candidate.closest(
+                            '[class*="time"], [class*="timeline"], [class*="slider"], [class*="scrubber"], [class*="playback"], [class*="timeslider"]'
+                        );
+
+                        if (!timelineContext && !/(time|timeline|slider|scrubber|playback|frame)/.test(label)) {
+                            continue;
+                        }
+
+                        if (directionalTokens.some((token) => label.includes(token))) {
+                            return candidate;
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            findTimelineSliderState(doc) {
+                if (!doc) {
+                    return null;
+                }
+
+                const candidates = Array.from(
+                    doc.querySelectorAll(
+                        '[role="slider"], input[type="range"], [aria-valuenow][aria-valuemax]'
+                    )
+                );
+
+                let best = null;
+                let bestNode = null;
+                for (const node of candidates) {
+                    const parsed = this.parseFramePositionFromSliderNode(node);
+                    if (!parsed) {
+                        continue;
+                    }
+
+                    const timelineContext = node.closest(
+                        '[class*="time"], [class*="timeline"], [class*="scrubber"], [class*="playback"], [class*="timeslider"], [class*="frame"]'
+                    );
+                    if (!parsed.hasTimelineToken && !timelineContext) {
+                        continue;
+                    }
+                    if (parsed.hasZoomToken) {
+                        continue;
+                    }
+
+                    if (!best || parsed.score > best.score) {
+                        best = parsed;
+                        bestNode = node;
+                    }
+                }
+
+                if (!bestNode || !best) {
+                    return null;
+                }
+
+                if (!Number.isFinite(best.score) || best.score < 4) {
+                    return null;
+                }
+
+                return {
+                    node: bestNode,
+                    current: best.current,
+                    total: best.total,
+                    minValue: best.minValue,
+                    nowValue: best.nowValue
+                };
+            }
+
+            moveTimelineSlider(doc, direction) {
+                const sliderState = this.findTimelineSliderState(doc);
+                if (!sliderState || !sliderState.node) {
+                    return false;
+                }
+
+                const total = Number(sliderState.total);
+                if (!Number.isFinite(total) || total < 2) {
+                    return false;
+                }
+
+                const step = direction >= 0 ? 1 : -1;
+                const current = Number(sliderState.current);
+                const minValue = Number(sliderState.minValue);
+                if (!Number.isFinite(current) || !Number.isFinite(minValue)) {
+                    return false;
+                }
+
+                const nextCurrent = ((current - 1 + step + total) % total) + 1;
+                const nextRawValue = minValue + nextCurrent - 1;
+                const node = sliderState.node;
+
+                if (typeof node.focus === 'function') {
+                    node.focus();
+                }
+
+                if ('value' in node) {
+                    node.value = String(nextRawValue);
+                }
+                node.setAttribute('aria-valuenow', String(nextRawValue));
+
+                try {
+                    const view = doc && doc.defaultView ? doc.defaultView : window;
+                    node.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: step > 0 ? 'ArrowRight' : 'ArrowLeft',
+                        code: step > 0 ? 'ArrowRight' : 'ArrowLeft',
+                        bubbles: true,
+                        cancelable: true,
+                        view
+                    }));
+                } catch (error) {
+                    // ignore
+                }
+
+                node.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                node.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                return true;
+            }
+
+            findPlaybackControl(doc, mode) {
+                const selectors = [
+                    '[aria-label]',
+                    '[title]',
+                    'button',
+                    '[role="button"]'
+                ];
+
+                const preferredTokens = mode === 'pause'
+                    ? ['pause', 'stop', 'playing']
+                    : ['play', 'resume'];
+
+                for (const selector of selectors) {
+                    let candidates = [];
+                    try {
+                        candidates = Array.from(doc.querySelectorAll(selector));
+                    } catch (error) {
+                        continue;
+                    }
+
+                    for (const candidate of candidates) {
+                        const label = this.normalizeText(
+                            candidate.getAttribute('aria-label') ||
+                            candidate.getAttribute('title') ||
+                            candidate.textContent
+                        );
+                        if (!label) {
+                            continue;
+                        }
+
+                        if (!/(play|pause|stop|timeline|animation|loop)/.test(label)) {
+                            continue;
+                        }
+
+                        if (
+                            candidate.hasAttribute('disabled') ||
+                            candidate.getAttribute('aria-disabled') === 'true'
+                        ) {
+                            continue;
+                        }
+
+                        if (preferredTokens.some((token) => label.includes(token))) {
+                            return candidate;
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            pauseTimelinePlayback(doc) {
+                if (!doc || this.playbackPaused) {
+                    return true;
+                }
+
+                if (this.playbackPauseAttempts >= this.maxPlaybackPauseAttempts) {
+                    return false;
+                }
+
+                const now = Date.now();
+                if (now - this.playbackLastActionAt < 1200) {
+                    return false;
+                }
+
+                const pauseControl = this.findPlaybackControl(doc, 'pause');
+                if (!pauseControl) {
+                    return false;
+                }
+
+                this.playbackPauseAttempts += 1;
+                this.playbackLastActionAt = now;
+
+                if (typeof pauseControl.focus === 'function') {
+                    pauseControl.focus();
+                }
+
+                if (typeof pauseControl.click === 'function') {
+                    pauseControl.click();
+                }
+
+                // If a visible play button now exists, animation has been paused.
+                const playControl = this.findPlaybackControl(doc, 'play');
+                if (playControl || this.playbackPauseAttempts > 2) {
+                    this.playbackPaused = true;
+                }
+
+                return this.playbackPaused;
+            }
+
+            activateRainTab(doc, mapRoot) {
+                const scope = mapRoot || doc;
+                const candidates = Array.from(scope.querySelectorAll('[role="tab"], button, a, [aria-label], [title]'));
+
+                for (const candidate of candidates) {
+                    const label = this.normalizeText(
+                        candidate.textContent ||
+                        candidate.getAttribute('aria-label') ||
+                        candidate.getAttribute('title')
+                    );
+
+                    if (!label || !label.includes('rain')) {
+                        continue;
+                    }
+
+                    if (candidate.tagName === 'A') {
+                        const href = candidate.getAttribute('href') || '';
+                        if (href.includes('/weather-and-climate/')) {
+                            continue;
+                        }
+                    }
+
+                    const selected =
+                        candidate.getAttribute('aria-selected') === 'true' ||
+                        candidate.getAttribute('aria-pressed') === 'true' ||
+                        candidate.classList.contains('active');
+
+                    if (selected) {
+                        return true;
+                    }
+
+                    if (typeof candidate.click === 'function') {
+                        candidate.click();
+                    }
+                    return true;
+                }
+
+                return false;
             }
         }
 

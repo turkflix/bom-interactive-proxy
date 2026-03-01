@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   bom-interactive-proxy:
     image: ghcr.io/turkflix/bom-interactive-proxy:latest
     container_name: bom-interactive-proxy
     ports:
-      - "8083:80"
+      - "${HOST_PORT:-8083}:80"
     environment:
       - TZ=Australia/Melbourne
     restart: unless-stopped

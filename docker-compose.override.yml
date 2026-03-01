@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Override to use simplified nginx config for immediate testing
 services:
   bom-interactive-proxy:

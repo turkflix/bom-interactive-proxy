@@ -4,7 +4,7 @@
 
 echo "🌦️  Testing BOM Interactive Proxy..."
 
-PROXY_URL="http://localhost:8083"
+PROXY_URL="${PROXY_URL:-http://localhost:8083}"
 
 # Test 1: Health check
 echo "📊 Testing health endpoint..."
@@ -26,7 +26,17 @@ else
     exit 1
 fi
 
-# Test 3: CORS headers
+# Test 3: Test harness page
+echo "🧪 Testing test harness page..."
+HARNESS=$(curl -s -o /dev/null -w "%{http_code}" ${PROXY_URL}/test-harness)
+if [ "$HARNESS" = "200" ]; then
+    echo "✅ Test harness accessible"
+else
+    echo "❌ Test harness failed (HTTP $HARNESS)"
+    exit 1
+fi
+
+# Test 4: CORS headers
 echo "🔗 Testing CORS headers..."
 CORS=$(curl -s -I ${PROXY_URL}/health | grep -i "access-control-allow-origin")
 if [ ! -z "$CORS" ]; then
@@ -36,7 +46,7 @@ else
     exit 1
 fi
 
-# Test 4: BOM proxy (basic)
+# Test 5: BOM proxy (basic)
 echo "🌐 Testing BOM proxy..."
 BOM=$(curl -s -o /dev/null -w "%{http_code}" ${PROXY_URL}/location/australia)
 if [ "$BOM" = "200" ] || [ "$BOM" = "301" ] || [ "$BOM" = "302" ]; then
@@ -46,7 +56,34 @@ else
     exit 1
 fi
 
+# Test 6: Mapping endpoints used by interactive map
+echo "🛰️  Testing mapping service endpoints..."
+WMTS=$(curl -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/timeseries/wmts?service=WMTS&request=GetCapabilities")
+OVERLAY=$(curl -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/overlays/forecast_districts/MapServer/0?f=pjson")
+BASEMAP=$(curl -s -o /dev/null -w "%{http_code}" "${PROXY_URL}/basemaps/basemap_default/MapServer?f=pjson")
+if [ "$WMTS" = "200" ] && [ "$OVERLAY" = "200" ] && [ "$BASEMAP" = "200" ]; then
+    echo "✅ Mapping endpoints reachable (WMTS=$WMTS OVERLAY=$OVERLAY BASEMAP=$BASEMAP)"
+else
+    echo "❌ Mapping endpoint failure (WMTS=$WMTS OVERLAY=$OVERLAY BASEMAP=$BASEMAP)"
+    exit 1
+fi
+
+# Test 7: Location HTML rewrite guardrail (must not leak direct api.bom.gov.au)
+echo "🧩 Testing location HTML rewrite..."
+LOC_HTML=$(curl -sS --compressed "${PROXY_URL}/location/australia/victoria/central/o2594692629-ashburton")
+if echo "$LOC_HTML" | rg -q "https://api\\.bom\\.gov\\.au|https:\\\\/\\\\/api\\.bom\\.gov\\.au"; then
+    echo "❌ Rewrite check failed (external api.bom.gov.au references still present)"
+    exit 1
+fi
+if echo "$LOC_HTML" | rg -q "BULLETPROOF INLINE Override executing"; then
+    echo "✅ Rewrite guardrail passed (inline override present)"
+else
+    echo "❌ Rewrite guardrail failed (inline override marker missing)"
+    exit 1
+fi
+
 echo ""
 echo "🎉 All tests passed!"
 echo "💡 Test the interactive map at: ${PROXY_URL}/map"
+echo "🧪 Test harness available at: ${PROXY_URL}/test-harness"
 echo "🏠 Use in Home Assistant with proxy_url: ${PROXY_URL}"

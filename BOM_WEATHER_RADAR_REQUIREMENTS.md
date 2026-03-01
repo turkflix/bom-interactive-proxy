@@ -14,7 +14,7 @@ Build a solution to embed interactive Australian Bureau of Meteorology (BOM) wea
 - **Responsive design** - works on desktop and mobile Home Assistant interfaces
 
 ### 2. Home Assistant Integration
-- **Dashboard embeddable** - works as iframe or custom card
+- **Dashboard embeddable** - works via iframe embedding from Home Assistant
 - **Configurable location** - set default location (e.g., Ashburton VIC 3147)
 - **Seamless integration** - looks native to Home Assistant interface
 - **No external dependencies** - self-contained solution

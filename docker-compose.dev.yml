@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   bom-interactive-proxy:
     build: .
     container_name: bom-interactive-proxy-dev
     ports:
-      - "8083:80"
+      - "${HOST_PORT:-8083}:80"
     environment:
       - TZ=Australia/Melbourne
     restart: unless-stopped

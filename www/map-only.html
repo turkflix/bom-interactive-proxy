@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BOM Map Only</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+    }
+
+    iframe {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      border: 0;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <iframe
+    id="mapFrame"
+    title="BOM Interactive Map"
+    sandbox="allow-scripts allow-same-origin allow-forms"
+    loading="eager">
+  </iframe>
+
+  <script>
+    async function registerMapCacheWorker() {
+      if (!("serviceWorker" in navigator)) {
+        return;
+      }
+
+      try {
+        const registration = await navigator.serviceWorker.register("/map-sw.js", { scope: "/" });
+        if (registration && registration.waiting) {
+          registration.waiting.postMessage({ type: "SKIP_WAITING" });
+        }
+        await navigator.serviceWorker.ready;
+      } catch (error) {
+        console.warn("Map cache service worker registration failed:", error);
+      }
+    }
+
+    (async function init() {
+      const params = new URLSearchParams(window.location.search);
+      const mapParams = new URLSearchParams();
+      mapParams.set("cleanup", "1");
+      mapParams.set("mapOnly", "1");
+      mapParams.set("rain", "1");
+
+      const passthroughKeys = [
+        "path",
+        "place",
+        "name",
+        "lat",
+        "lon",
+        "lng",
+        "latitude",
+        "longitude",
+        "coords",
+        "zoom",
+        "lowPower",
+        "lowpower",
+        "animate",
+        "autoplay",
+        "animateMode",
+        "animatemode",
+        "animateInterval",
+        "animatems",
+        "frameSkip",
+        "frameskip",
+        "showFrameTime",
+        "showTime"
+      ];
+
+      passthroughKeys.forEach((key) => {
+        if (params.has(key)) {
+          mapParams.set(key, params.get(key));
+        }
+      });
+
+      const hasLocationHint =
+        mapParams.has("path") ||
+        mapParams.has("place") ||
+        mapParams.has("name") ||
+        mapParams.has("coords") ||
+        ((mapParams.has("lat") || mapParams.has("latitude")) &&
+          (mapParams.has("lon") || mapParams.has("lng") || mapParams.has("longitude")));
+
+      if (!hasLocationHint) {
+        mapParams.set("path", "australia/victoria/central/o2594692629-ashburton");
+      }
+
+      await registerMapCacheWorker();
+      const src = `/map?${mapParams.toString()}`;
+      document.getElementById("mapFrame").src = src;
+    })();
+  </script>
+</body>
+</html>
