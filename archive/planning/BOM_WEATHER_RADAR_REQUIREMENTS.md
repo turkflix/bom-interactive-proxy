@@ -15,7 +15,7 @@ Build a solution to embed interactive Australian Bureau of Meteorology (BOM) wea
 
 ### 2. Home Assistant Integration
 - **Dashboard embeddable** - works via iframe embedding from Home Assistant
-- **Configurable location** - set default location (e.g., Ashburton VIC 3147)
+- **Configurable location** - set default location (e.g., Melbourne VIC 3000)
 - **Seamless integration** - looks native to Home Assistant interface
 - **No external dependencies** - self-contained solution
 
@@ -30,7 +30,7 @@ Build a solution to embed interactive Australian Bureau of Meteorology (BOM) wea
 
 ### Primary BOM Resources
 - **Main site:** https://www.bom.gov.au
-- **Ashburton weather:** https://www.bom.gov.au/location/australia/victoria/central/o2594692629-ashburton
+- **Melbourne weather:** https://www.bom.gov.au/location/australia/victoria/central/bvic_pt042-melbourne
 - **API endpoints:** https://api.bom.gov.au/apikey/v1/locations/places/details/place/o2594692629
 - **Radar data:** Various BOM radar and satellite imagery endpoints
 - **Static assets:** CSS, JavaScript, fonts, images from BOM domains
@@ -87,7 +87,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -f http://localhost
 ```yaml
 # Target HA dashboard card configuration
 type: iframe
-url: http://[container-ip]:8080/weather-radar?location=ashburton&state=vic
+url: http://[container-ip]:8080/weather-radar?location=melbourne&state=vic
 title: "BOM Weather Radar"  
 aspect_ratio: 75%
 ```
@@ -103,7 +103,7 @@ aspect_ratio: 75%
 
 ### Minimum Viable Product (MVP)
 - ✅ **Container starts successfully** - no startup errors
-- ✅ **BOM page loads** - displays Ashburton weather information  
+- ✅ **BOM page loads** - displays Melbourne weather information  
 - ✅ **Basic interactivity** - can click radar map button
 - ✅ **Home Assistant embed** - works as iframe in HA dashboard
 - ✅ **Automated tests pass** - all test suites green

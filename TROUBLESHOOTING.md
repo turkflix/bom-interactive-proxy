@@ -117,7 +117,7 @@ nginx -t  # Test config
 **Network debugging:**
 ```bash
 # Test from HA host
-curl -v http://192.168.86.62:8083/health
+curl -v http://HOME_ASSISTANT_HOST_OR_IP:8083/health
 
 # Check port binding
 netstat -tlnp | grep :8083

@@ -1,7 +1,7 @@
 # JavaScript Audit (Map Mode)
 
 Audit target:
-- `GET /location/australia/victoria/central/o2594692629-ashburton` via local proxy
+- `GET /location/australia/victoria/central/bvic_pt042-melbourne` via local proxy
 
 Observed script tags:
 1. Inline API override injection (`<head>` inline script)

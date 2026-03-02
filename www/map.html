@@ -114,6 +114,9 @@
                 this.animateMode = 'native';
                 this.animateIntervalMs = 2000;
                 this.frameSkip = 1;
+                this.displayTimeZone = 'Australia/Melbourne';
+                this.maxRadarTimestampAgeMs = 8 * 60 * 60 * 1000;
+                this.maxRadarFutureSkewMs = 20 * 60 * 1000;
                 this.throttledAnimationTimer = null;
                 this.lastThrottledAnimationAt = 0;
                 this.lastFramePosition = null;
@@ -126,6 +129,11 @@
                     'atm_surf_air_precip_rate_1hr_total_mm_h',
                     'atm_surf_air_precip_accumulation_1hr_total_mm'
                 ];
+                this.radarLastActiveTimestamp = '';
+                this.radarLastActiveSeenAt = 0;
+                this.timelineMappingDirection = 0;
+                this.timelineMappingVotesDirect = 0;
+                this.timelineMappingVotesReversed = 0;
                 this.frameTimeOverlay = null;
                 this.frameTimeTimer = null;
                 this.frameTimeIntervalMs = 5000;
@@ -217,6 +225,7 @@
                     const animateModeParam = params.get('animateMode') ?? params.get('animatemode');
                     const animateIntervalParam = params.get('animateInterval') ?? params.get('animatems');
                     const frameSkipParam = params.get('frameSkip') ?? params.get('frameskip');
+                    const timeZoneParam = params.get('tz') ?? params.get('timezone') ?? params.get('timeZone');
                     const showFrameTimeParam = params.get('showFrameTime') ?? params.get('showTime');
                     const showTownNamesParam =
                         params.get('showTownNames') ??
@@ -256,6 +265,7 @@
                     const animateMode = this.parseAnimateMode(animateModeParam);
                     const animateIntervalMs = this.parseAnimateInterval(animateIntervalParam);
                     const frameSkip = this.parseFrameSkip(frameSkipParam);
+                    const displayTimeZone = this.parseDisplayTimeZone(timeZoneParam);
                     const requestedZoom = this.parseRequestedZoom(params.get('zoom'));
                     const requestedZoomStart = this.parseRequestedZoom(zoomStartParam);
                     this.bomPath = bomPath;
@@ -270,6 +280,7 @@
                     this.animateMode = animateMode;
                     this.animateIntervalMs = animateIntervalMs;
                     this.frameSkip = frameSkip;
+                    this.displayTimeZone = displayTimeZone;
                     this.frameTimeIntervalMs = this.resolveFrameTimeIntervalMs();
                     if (this.forceRain || this.shouldUseThrottledAnimation() || this.showFrameTime) {
                         const frameMetadata = await this.resolveRadarFrameMetadata();
@@ -288,6 +299,11 @@
                     this.lastFramePosition = null;
                     this.lastInternalFrameStepAt = 0;
                     this.lastObservedFrameLabel = '';
+                    this.radarLastActiveTimestamp = '';
+                    this.radarLastActiveSeenAt = 0;
+                    this.timelineMappingDirection = 0;
+                    this.timelineMappingVotesDirect = 0;
+                    this.timelineMappingVotesReversed = 0;
                     if (this.animate && this.animateMode === 'throttle') {
                         this.lastFramePosition = { current: 1, total: this.defaultFrameTotal };
                     }
@@ -1168,6 +1184,22 @@
                 return Math.max(1, Math.min(6, parsed));
             }
 
+            parseDisplayTimeZone(value) {
+                const fallbackTimeZone = 'Australia/Melbourne';
+                if (value === null || value === undefined || String(value).trim() === '') {
+                    return fallbackTimeZone;
+                }
+
+                const candidate = String(value).trim();
+                try {
+                    new Intl.DateTimeFormat('en-AU', { timeZone: candidate }).format(new Date());
+                    return candidate;
+                } catch (error) {
+                    console.warn(`Invalid timezone "${candidate}", using ${fallbackTimeZone}`);
+                    return fallbackTimeZone;
+                }
+            }
+
             async resolveRadarFrameMetadata() {
                 const capabilitiesUrl = '/timeseries/wmts?service=WMTS&request=GetCapabilities';
                 try {
@@ -1206,6 +1238,18 @@
 
                     const total = timeline.length;
                     if (!Number.isFinite(total) || total < 2) {
+                        return null;
+                    }
+
+                    const latestTimelineMs = Date.parse(String(timeline[timeline.length - 1] || ''));
+                    if (
+                        Number.isFinite(latestTimelineMs) &&
+                        Number.isFinite(this.maxRadarTimestampAgeMs) &&
+                        this.maxRadarTimestampAgeMs > 0 &&
+                        Date.now() - latestTimelineMs > this.maxRadarTimestampAgeMs
+                    ) {
+                        // Some BOM GetCapabilities responses can lag by many hours.
+                        // Ignore stale metadata; live tile timestamps will hydrate timeline state.
                         return null;
                     }
 
@@ -2179,49 +2223,244 @@
                 return this.collectResourceEntries()
                     .filter((entry) => entry && entry.name && this.isRadarTimelineEntryUrl(entry.name))
                     .map((entry) => ({
-                        time: entry.startTime || 0,
+                        time: Number.isFinite(entry.time) ? entry.time : 0,
                         timestamp: this.extractFrameTimestamp(entry.name)
                     }))
                     .filter((item) => Boolean(item.timestamp));
             }
 
-            ensureRadarTimelineFromFrameEntries(frameEntries) {
-                if (Array.isArray(this.radarFrameTimeline) && this.radarFrameTimeline.length >= 2) {
-                    return false;
-                }
+            buildSortedUniqueRadarTimeline(values) {
+                const now = Date.now();
+                const maxAgeMs = Number.isFinite(this.maxRadarTimestampAgeMs) ? this.maxRadarTimestampAgeMs : 0;
+                const maxFutureSkewMs = Number.isFinite(this.maxRadarFutureSkewMs) ? this.maxRadarFutureSkewMs : 0;
 
-                if (!Array.isArray(frameEntries) || frameEntries.length < 2) {
-                    return false;
-                }
-
-                const uniqueTimeline = Array.from(
+                return Array.from(
                     new Set(
-                        frameEntries
-                            .map((item) => String(item && item.timestamp ? item.timestamp : '').trim())
-                            .filter((value) => Boolean(value) && Number.isFinite(Date.parse(value)))
-                            .sort((a, b) => Date.parse(a) - Date.parse(b))
-                    )
-                );
+                        (Array.isArray(values) ? values : [])
+                            .map((value) => {
+                                const normalized = String(value || '').trim();
+                                const ms = Date.parse(normalized);
+                                return {
+                                    normalized,
+                                    ms
+                                };
+                            })
+                            .filter((item) => {
+                                if (!item.normalized || !Number.isFinite(item.ms)) {
+                                    return false;
+                                }
 
-                if (uniqueTimeline.length < 2) {
+                                if (maxFutureSkewMs >= 0 && item.ms > now + maxFutureSkewMs) {
+                                    return false;
+                                }
+
+                                if (maxAgeMs > 0 && item.ms < now - maxAgeMs) {
+                                    return false;
+                                }
+
+                                return true;
+                            })
+                            .map((item) => item.normalized)
+                    )
+                ).sort((a, b) => Date.parse(a) - Date.parse(b));
+            }
+
+            mergeRadarTimelineFromFrameEntries(frameEntries, options = {}) {
+                const onlyWhenMissing = Boolean(options.onlyWhenMissing);
+                const existingTimeline = Array.isArray(this.radarFrameTimeline) ? this.radarFrameTimeline : [];
+                if (onlyWhenMissing && existingTimeline.length >= 2) {
                     return false;
                 }
 
-                this.radarFrameTimeline = uniqueTimeline;
-                this.defaultFrameTotal = uniqueTimeline.length;
+                if (!Array.isArray(frameEntries) || frameEntries.length === 0) {
+                    return false;
+                }
 
-                const existing = this.normalizeFramePosition(this.lastFramePosition);
-                if (!existing || existing.total !== uniqueTimeline.length) {
-                    const nextCurrent = existing
-                        ? Math.max(1, Math.min(uniqueTimeline.length, existing.current))
+                const incomingTimeline = frameEntries
+                    .map((item) => String(item && item.timestamp ? item.timestamp : '').trim())
+                    .filter(Boolean);
+                if (!incomingTimeline.length) {
+                    return false;
+                }
+
+                const mergedTimeline = this.buildSortedUniqueRadarTimeline(
+                    existingTimeline.concat(incomingTimeline)
+                );
+                if (mergedTimeline.length < 2) {
+                    return false;
+                }
+
+                const changed =
+                    existingTimeline.length !== mergedTimeline.length ||
+                    existingTimeline.some((item, index) => item !== mergedTimeline[index]);
+
+                this.radarFrameTimeline = mergedTimeline;
+                const defaultHint = Math.round(Number(this.defaultFrameTotal));
+                const safeDefaultTotal = Number.isFinite(defaultHint) && defaultHint >= 2
+                    ? defaultHint
+                    : Math.min(24, mergedTimeline.length);
+                const resolvedTotal = Math.max(2, Math.min(mergedTimeline.length, safeDefaultTotal));
+                this.defaultFrameTotal = resolvedTotal;
+
+                const existingFramePosition = this.normalizeFramePosition(this.lastFramePosition);
+                if (!existingFramePosition || existingFramePosition.total !== resolvedTotal) {
+                    const nextCurrent = existingFramePosition
+                        ? Math.max(1, Math.min(resolvedTotal, existingFramePosition.current))
                         : 1;
                     this.lastFramePosition = {
                         current: nextCurrent,
-                        total: uniqueTimeline.length
+                        total: resolvedTotal
                     };
                 }
 
-                return true;
+                return changed;
+            }
+
+            ensureRadarTimelineFromFrameEntries(frameEntries) {
+                return this.mergeRadarTimelineFromFrameEntries(frameEntries, { onlyWhenMissing: true });
+            }
+
+            getEffectiveRadarTimeline(totalHint = null) {
+                const timeline = Array.isArray(this.radarFrameTimeline) ? this.radarFrameTimeline : [];
+                if (timeline.length < 2) {
+                    return timeline;
+                }
+
+                const parsedHint = Math.round(Number(totalHint));
+                if (!Number.isFinite(parsedHint) || parsedHint < 2 || parsedHint >= timeline.length) {
+                    return timeline;
+                }
+
+                return timeline.slice(-parsedHint);
+            }
+
+            resolveFramePositionForTimestamp(timestamp, totalHint = null) {
+                const timeline = this.getEffectiveRadarTimeline(totalHint);
+                if (!timestamp || timeline.length < 2) {
+                    return null;
+                }
+
+                const normalizedTimestamp = String(timestamp).trim();
+                const normalizedMs = Date.parse(normalizedTimestamp);
+
+                let index = timeline.indexOf(normalizedTimestamp);
+                if (index < 0 && Number.isFinite(normalizedMs)) {
+                    index = timeline.findIndex((value) => Date.parse(String(value || '')) === normalizedMs);
+                }
+                if (index < 0) {
+                    return null;
+                }
+
+                return {
+                    current: index + 1,
+                    total: timeline.length
+                };
+            }
+
+            selectActiveRadarTimestamp(frameEntries) {
+                if (!Array.isArray(frameEntries) || frameEntries.length === 0) {
+                    return null;
+                }
+
+                const orderedEntries = frameEntries
+                    .filter((item) => item && item.timestamp)
+                    .slice()
+                    .sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+                if (!orderedEntries.length) {
+                    return null;
+                }
+
+                const latest = orderedEntries[orderedEntries.length - 1];
+                const latestTime = Number(latest.time);
+                const recencyWindowMs = Math.max(
+                    1200,
+                    Math.min(6000, Math.round(this.animateIntervalMs * 1.4))
+                );
+
+                let candidates = orderedEntries;
+                if (Number.isFinite(latestTime)) {
+                    const recent = orderedEntries.filter((entry) => Number.isFinite(entry.time) && (latestTime - entry.time) <= recencyWindowMs);
+                    if (recent.length >= 2) {
+                        candidates = recent;
+                    } else {
+                        candidates = orderedEntries.slice(Math.max(0, orderedEntries.length - 80));
+                    }
+                }
+
+                const statsByTimestamp = new Map();
+                for (const entry of candidates) {
+                    const timestamp = String(entry.timestamp || '').trim();
+                    if (!timestamp) {
+                        continue;
+                    }
+
+                    const time = Number(entry.time) || 0;
+                    const previous = statsByTimestamp.get(timestamp) || { count: 0, lastSeenAt: 0 };
+                    statsByTimestamp.set(timestamp, {
+                        count: previous.count + 1,
+                        lastSeenAt: Math.max(previous.lastSeenAt, time)
+                    });
+                }
+
+                let bestTimestamp = '';
+                let bestCount = -1;
+                let bestLastSeenAt = -1;
+                for (const [timestamp, stats] of statsByTimestamp.entries()) {
+                    if (
+                        stats.lastSeenAt > bestLastSeenAt ||
+                        (stats.lastSeenAt === bestLastSeenAt && stats.count > bestCount)
+                    ) {
+                        bestTimestamp = timestamp;
+                        bestCount = stats.count;
+                        bestLastSeenAt = stats.lastSeenAt;
+                    }
+                }
+
+                const fallbackTimestamp = String(latest.timestamp || '').trim();
+                return {
+                    timestamp: bestTimestamp || fallbackTimestamp,
+                    seenAt: bestLastSeenAt > 0 ? bestLastSeenAt : (Number(latest.time) || 0)
+                };
+            }
+
+            deriveNetworkFrameState(frameEntries) {
+                if (!Array.isArray(frameEntries) || frameEntries.length === 0) {
+                    return null;
+                }
+
+                this.mergeRadarTimelineFromFrameEntries(frameEntries);
+
+                const active = this.selectActiveRadarTimestamp(frameEntries);
+                if (!active || !active.timestamp) {
+                    return null;
+                }
+
+                const timestamp = String(active.timestamp).trim();
+                const seenAt = Number(active.seenAt) || 0;
+                if (timestamp) {
+                    this.radarLastActiveTimestamp = timestamp;
+                }
+                if (seenAt > 0) {
+                    this.radarLastActiveSeenAt = seenAt;
+                }
+
+                const positionTotalHint = this.lastFramePosition && Number.isFinite(this.lastFramePosition.total)
+                    ? this.lastFramePosition.total
+                    : this.defaultFrameTotal;
+                const position = this.resolveFramePositionForTimestamp(timestamp, positionTotalHint);
+                const freshnessBudgetMs = Math.max(
+                    3000,
+                    Math.min(12000, Math.round(this.animateIntervalMs * 2.6))
+                );
+                const isFresh = seenAt > 0 ? (Date.now() - seenAt) <= freshnessBudgetMs : false;
+
+                return {
+                    timestamp,
+                    label: this.formatFrameTimestamp(timestamp),
+                    position,
+                    seenAt,
+                    isFresh
+                };
             }
 
             formatFrameTimestamp(timestamp) {
@@ -2230,13 +2469,31 @@
                     return timestamp;
                 }
 
-                const localText = parsed.toLocaleString([], {
+                const resolvedTimeZone = this.parseDisplayTimeZone(this.displayTimeZone);
+                const formatOptions = {
+                    timeZone: resolvedTimeZone,
                     weekday: 'short',
                     month: 'short',
                     day: '2-digit',
                     hour: '2-digit',
-                    minute: '2-digit'
-                });
+                    minute: '2-digit',
+                    hour12: true,
+                    timeZoneName: 'short'
+                };
+
+                let localText = '';
+                try {
+                    localText = parsed.toLocaleString('en-AU', formatOptions);
+                } catch (error) {
+                    localText = parsed.toLocaleString('en-AU', {
+                        weekday: 'short',
+                        month: 'short',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: true
+                    });
+                }
 
                 return `${localText}`;
             }
@@ -2251,8 +2508,13 @@
                     return null;
                 }
 
-                const index = Math.max(0, Math.min(this.radarFrameTimeline.length - 1, current - 1));
-                const timestamp = this.radarFrameTimeline[index];
+                const timeline = this.getEffectiveRadarTimeline(framePosition.total);
+                if (!Array.isArray(timeline) || timeline.length < 2) {
+                    return null;
+                }
+
+                const index = Math.max(0, Math.min(timeline.length - 1, current - 1));
+                const timestamp = timeline[index];
                 if (!timestamp) {
                     return null;
                 }
@@ -2477,6 +2739,59 @@
                 return { current, total };
             }
 
+            mapFramePositionToTimeline(position) {
+                const normalized = this.normalizeFramePosition(position);
+                if (!normalized) {
+                    return null;
+                }
+
+                if (this.timelineMappingDirection < 0) {
+                    return {
+                        current: normalized.total - normalized.current + 1,
+                        total: normalized.total
+                    };
+                }
+
+                return normalized;
+            }
+
+            observeTimelineOrientation(rawSliderPosition, networkPosition) {
+                const slider = this.normalizeFramePosition(rawSliderPosition);
+                const network = this.normalizeFramePosition(networkPosition);
+                if (!slider || !network || slider.total !== network.total || slider.total < 2) {
+                    return false;
+                }
+
+                const directDistance = Math.abs(slider.current - network.current);
+                const reversedCurrent = slider.total - slider.current + 1;
+                const reversedDistance = Math.abs(reversedCurrent - network.current);
+
+                if (directDistance === reversedDistance) {
+                    return false;
+                }
+
+                if (reversedDistance < directDistance) {
+                    this.timelineMappingVotesReversed += 1;
+                } else {
+                    this.timelineMappingVotesDirect += 1;
+                }
+
+                const voteGap = Math.abs(this.timelineMappingVotesReversed - this.timelineMappingVotesDirect);
+                const totalVotes = this.timelineMappingVotesReversed + this.timelineMappingVotesDirect;
+
+                if (voteGap < 2 || totalVotes < 4) {
+                    return false;
+                }
+
+                const nextDirection = this.timelineMappingVotesReversed > this.timelineMappingVotesDirect ? -1 : 1;
+                if (nextDirection === this.timelineMappingDirection) {
+                    return false;
+                }
+
+                this.timelineMappingDirection = nextDirection;
+                return true;
+            }
+
             updateLastFramePosition(position) {
                 const normalized = this.normalizeFramePosition(position);
                 if (!normalized) {
@@ -2503,28 +2818,52 @@
 
             collectResourceEntries() {
                 const entries = [];
-                const appendRecent = (sourceEntries) => {
-                    if (!Array.isArray(sourceEntries) || !sourceEntries.length) {
+                const appendRecent = (targetWindow) => {
+                    if (!targetWindow || !targetWindow.performance || typeof targetWindow.performance.getEntriesByType !== 'function') {
                         return;
                     }
-                    const maxEntries = 600;
-                    const startIndex = Math.max(0, sourceEntries.length - maxEntries);
-                    entries.push(...sourceEntries.slice(startIndex));
+
+                    try {
+                        const performanceApi = targetWindow.performance;
+                        const sourceEntries = performanceApi.getEntriesByType('resource');
+                        if (!Array.isArray(sourceEntries) || !sourceEntries.length) {
+                            return;
+                        }
+
+                        const maxEntries = 600;
+                        const startIndex = Math.max(0, sourceEntries.length - maxEntries);
+                        const timeOrigin = Number.isFinite(performanceApi.timeOrigin)
+                            ? performanceApi.timeOrigin
+                            : (Date.now() - (typeof performanceApi.now === 'function' ? performanceApi.now() : 0));
+
+                        for (const sourceEntry of sourceEntries.slice(startIndex)) {
+                            if (!sourceEntry || !sourceEntry.name) {
+                                continue;
+                            }
+
+                            const startTime = Number(sourceEntry.startTime);
+                            const absoluteTime = Number.isFinite(startTime)
+                                ? timeOrigin + startTime
+                                : timeOrigin;
+
+                            entries.push({
+                                name: sourceEntry.name,
+                                time: absoluteTime,
+                                startTime: Number.isFinite(startTime) ? startTime : 0
+                            });
+                        }
+                    } catch (error) {
+                        // ignore
+                    }
                 };
 
-                try {
-                    appendRecent(window.performance.getEntriesByType('resource'));
-                } catch (error) {
-                    // ignore
+                appendRecent(window);
+
+                if (this.frame && this.frame.contentWindow) {
+                    appendRecent(this.frame.contentWindow);
                 }
 
-                try {
-                    if (this.frame && this.frame.contentWindow) {
-                        appendRecent(this.frame.contentWindow.performance.getEntriesByType('resource'));
-                    }
-                } catch (error) {
-                    // ignore
-                }
+                entries.sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
 
                 return entries;
             }
@@ -2546,7 +2885,7 @@
                             }
                         }
                         return {
-                            time: entry && typeof entry.startTime === 'number' ? entry.startTime : 0,
+                            time: entry && Number.isFinite(entry.time) ? entry.time : 0,
                             zoom: match ? Number(match[1]) : NaN
                         };
                     })
@@ -3120,6 +3459,8 @@
                     const sliderPosition = sliderState
                         ? { current: Number(sliderState.current), total: Number(sliderState.total) }
                         : null;
+                    const normalizedSliderPosition = this.normalizeFramePosition(sliderPosition);
+                    let mappedSliderPosition = this.mapFramePositionToTimeline(normalizedSliderPosition);
                     const domLabel = throttledMode
                         ? (
                             this.extractFrameLabelFromSliderState(sliderState) ||
@@ -3131,44 +3472,47 @@
                         );
                     let framePosition = throttledMode
                         ? this.lastFramePosition
-                        : (this.updateLastFramePosition(sliderPosition) || sliderPosition);
+                        : (this.updateLastFramePosition(mappedSliderPosition) || mappedSliderPosition);
+                    if (throttledMode && mappedSliderPosition) {
+                        framePosition = this.updateLastFramePosition(mappedSliderPosition) || mappedSliderPosition;
+                    }
                     if (!throttledMode && !framePosition) {
                         framePosition = this.extractFramePositionFromDOM(frameDoc);
                         framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                     }
 
                     let fallbackLabel = null;
-                    const timelineUnavailable = !Array.isArray(this.radarFrameTimeline) || this.radarFrameTimeline.length < 2;
-                    const timelineStale = throttledMode && this.isRadarTimelineStale();
-                    const preferEntrySignals = throttledMode && (timelineUnavailable || timelineStale);
-                    if ((!fastMode && (!domLabel || !framePosition)) || preferEntrySignals) {
+                    let networkState = null;
+                    const shouldSampleNetwork = throttledMode || !fastMode || !domLabel || !framePosition;
+                    if (shouldSampleNetwork) {
                         const frameEntries = this.collectRadarFrameEntries();
-
                         if (frameEntries.length) {
-                            frameEntries.sort((a, b) => a.time - b.time);
-                            const latest = frameEntries[frameEntries.length - 1].timestamp;
-                            const entryLabel = this.formatFrameTimestamp(latest);
-                            const entryPosition = this.extractFramePositionFromEntries(frameEntries);
-
-                            if (preferEntrySignals) {
-                                if (timelineUnavailable) {
-                                    this.ensureRadarTimelineFromFrameEntries(frameEntries);
+                            networkState = this.deriveNetworkFrameState(frameEntries);
+                            if (networkState) {
+                                const orientationChanged =
+                                    networkState.isFresh &&
+                                    this.observeTimelineOrientation(normalizedSliderPosition, networkState.position);
+                                if (orientationChanged && normalizedSliderPosition) {
+                                    mappedSliderPosition = this.mapFramePositionToTimeline(normalizedSliderPosition);
+                                    if (mappedSliderPosition) {
+                                        framePosition = this.updateLastFramePosition(mappedSliderPosition) || mappedSliderPosition;
+                                    }
                                 }
-                                fallbackLabel = entryLabel;
-                                // In throttled mode, keep x/y tied to the internal step counter.
-                                // Use radar-only entries for label fallback when metadata timeline is stale/missing.
-                                void entryPosition;
-                            } else {
-                                fallbackLabel = entryLabel;
-                                if (!framePosition && entryPosition) {
-                                    framePosition = entryPosition;
-                                }
-                            }
 
-                            if (framePosition) {
-                                framePosition = this.updateLastFramePosition(framePosition) || framePosition;
+                                fallbackLabel = networkState.label || null;
+                                if (
+                                    networkState.position &&
+                                    !mappedSliderPosition &&
+                                    (networkState.isFresh || !framePosition)
+                                ) {
+                                    framePosition = networkState.position;
+                                }
                             }
                         }
+                    }
+
+                    if (framePosition) {
+                        framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                     }
 
                     if (!framePosition) {
@@ -3179,13 +3523,26 @@
                         this.lastFramePosition = framePosition;
                     }
 
-                    const timelineLabel = throttledMode && !this.isRadarTimelineStale()
-                        ? this.formatTimelineLabelForFrame(framePosition)
-                        : null;
-                    const effectiveLabel = throttledMode
-                        ? (timelineLabel || domLabel || fallbackLabel || '')
-                        : (timelineLabel || domLabel || fallbackLabel || '');
-                    if (throttledMode) {
+                    const timelineFresh = !this.isRadarTimelineStale();
+                    if (
+                        !timelineFresh &&
+                        networkState &&
+                        networkState.isFresh &&
+                        networkState.position
+                    ) {
+                        framePosition = this.updateLastFramePosition(networkState.position) || networkState.position;
+                    }
+
+                    const timelineLabel = this.formatTimelineLabelForFrame(framePosition);
+                    const hasFreshNetworkLabel = Boolean(
+                        networkState && networkState.isFresh && networkState.label
+                    );
+                    const effectiveLabel = (timelineFresh ? timelineLabel : null) ||
+                        (hasFreshNetworkLabel
+                            ? networkState.label
+                            : (domLabel || fallbackLabel || ''));
+
+                    if (throttledMode && !hasFreshNetworkLabel) {
                         const normalizedLabel = this.normalizeText(effectiveLabel);
                         if (normalizedLabel) {
                             const labelChanged =
@@ -3206,6 +3563,8 @@
 
                             this.lastObservedFrameLabel = normalizedLabel;
                         }
+                    } else if (throttledMode) {
+                        this.lastObservedFrameLabel = this.normalizeText(effectiveLabel);
                     }
 
                     const overlayLabel = this.composeFrameOverlayLabel(effectiveLabel, framePosition);
