@@ -248,6 +248,12 @@
                     this.animateIntervalMs = animateIntervalMs;
                     this.frameSkip = frameSkip;
                     this.frameTimeIntervalMs = this.resolveFrameTimeIntervalMs();
+                    if (this.forceRain || this.shouldUseThrottledAnimation() || this.showFrameTime) {
+                        const discoveredFrameTotal = await this.resolveRadarFrameTotal();
+                        if (Number.isFinite(discoveredFrameTotal) && discoveredFrameTotal >= 2) {
+                            this.defaultFrameTotal = discoveredFrameTotal;
+                        }
+                    }
                     this.lastThrottledAnimationAt = 0;
                     this.lastFramePosition = null;
                     this.lastInternalFrameStepAt = 0;
@@ -557,6 +563,37 @@
                 }
 
                 return Math.max(1, Math.min(6, parsed));
+            }
+
+            async resolveRadarFrameTotal() {
+                const capabilitiesUrl = '/timeseries/wmts?service=WMTS&request=GetCapabilities';
+                try {
+                    const response = await fetch(capabilitiesUrl, {
+                        cache: 'no-store',
+                        credentials: 'same-origin'
+                    });
+                    if (!response.ok) {
+                        return null;
+                    }
+
+                    const xml = await response.text();
+                    const layerMatch = xml.match(
+                        /<Layer>[\s\S]*?<ows:Identifier>\s*atm_surf_air_precip_reflectivity_dbz\s*<\/ows:Identifier>([\s\S]*?)<\/Layer>/i
+                    );
+                    if (!layerMatch || !layerMatch[1]) {
+                        return null;
+                    }
+
+                    const values = layerMatch[1].match(/<Value>/g) || [];
+                    const total = values.length;
+                    if (!Number.isFinite(total) || total < 2) {
+                        return null;
+                    }
+
+                    return Math.max(2, Math.min(24, total));
+                } catch (error) {
+                    return null;
+                }
             }
 
             resolveFrameTimeIntervalMs() {
