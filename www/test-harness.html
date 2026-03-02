@@ -461,7 +461,7 @@
         /<script[^>]*\ssrc=["']https:\/\/(www\.bom\.gov\.au\/akam\/|apm\.analytics\.bom\.gov\.au|s2?\.go-mpulse\.net\/boomerang\/|www\.googletagmanager\.com|www\.google\.com\/recaptcha\/|www\.gstatic\.com\/recaptcha\/)/i;
       const hasExternalTelemetryScriptEnabled = activeExternalTelemetryScriptPattern.test(html);
       const hasMapMainBundle = /<script[^>]*\ssrc=["']\/themes\/custom\/bom_theme\/bom-react\/dist\/main\.bundle\.js/i.test(html);
-      const hasInlineOverride = html.includes("API_HOST_RE=/https:\\/\\/api(?:\\.test2)?\\.bom\\.gov\\.au/g");
+      const hasInlineOverride = /<script[^>]*\ssrc=["']\/inject-api-override\.js/i.test(html);
       if (hasExternalApiHost) {
         log("Location HTML still includes external api.bom.gov.au host references");
       }
@@ -472,7 +472,7 @@
         log("Location HTML missing required BOM React main bundle script");
       }
       if (!hasInlineOverride) {
-        log("Location HTML missing inline API override marker");
+        log("Location HTML missing override script reference");
       }
 
       return !hasExternalApiHost && !hasExternalTelemetryScriptEnabled && hasMapMainBundle && hasInlineOverride;

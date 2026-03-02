@@ -83,10 +83,26 @@ if ! echo "$LOC_HTML" | rg -Pq "<script[^>]*\\ssrc=['\"]/themes/custom/bom_theme
     echo "❌ Rewrite check failed (required BOM React main bundle missing)"
     exit 1
 fi
-if echo "$LOC_HTML" | rg -Fq "API_HOST_RE=/https:\\/\\/api(?:\\.test2)?\\.bom\\.gov\\.au/g"; then
-    echo "✅ Rewrite guardrail passed (inline override present + external telemetry stripped)"
+if echo "$LOC_HTML" | rg -Pq "<script[^>]*\\ssrc=['\"]/inject-api-override\\.js"; then
+    echo "✅ Rewrite guardrail passed (override script present + external telemetry stripped)"
 else
-    echo "❌ Rewrite guardrail failed (inline override marker missing)"
+    echo "❌ Rewrite guardrail failed (override script tag missing)"
+    exit 1
+fi
+
+if echo "$LOC_HTML" | rg -qi "googletagmanager\\.com"; then
+    echo "❌ Rewrite check failed (GTM host still present in location HTML)"
+    exit 1
+fi
+
+if echo "$LOC_HTML" | rg -Pq "(?<!data-disabled-)(?:src|href)=['\"][^'\"]+\\.(?:woff2?|svg)(?:\\?[^'\"]*)?['\"]"; then
+    echo "❌ Rewrite check failed (active WOFF/SVG asset references still present)"
+    exit 1
+fi
+
+TOWNS_QUERY=$(curl -sS "${PROXY_URL}/overlays/towns_and_cities/FeatureServer/3/query?where=1%3D1&outFields=*&f=pjson")
+if ! echo "$TOWNS_QUERY" | rg -q '"features":\[\]'; then
+    echo "❌ Overlay check failed (towns_and_cities query not empty)"
     exit 1
 fi
 

@@ -1682,19 +1682,63 @@
                     return null;
                 }
 
+                const extractFromText = (value) => {
+                    const text = String(value || '').replace(/\s+/g, ' ').trim();
+                    if (!text) {
+                        return null;
+                    }
+
+                    const patterns = [
+                        /\b(?:mon|tue|wed|thu|fri|sat|sun)\w*\s+\d{1,2}\s+\w{3},?\s+\d{1,2}:\d{2}\s*(?:am|pm)\b/i,
+                        /\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i
+                    ];
+
+                    for (const pattern of patterns) {
+                        const match = text.match(pattern);
+                        if (match && match[0]) {
+                            return match[0];
+                        }
+                    }
+
+                    return null;
+                };
+
                 const candidates = Array.from(
                     doc.querySelectorAll(
                         '[class*="time"], [class*="timeline"], [class*="slider"], [aria-live], [data-testid*="time"]'
                     )
                 );
 
+                for (const candidate of candidates) {
+                    const match = extractFromText(candidate.textContent);
+                    if (match) {
+                        return match;
+                    }
+                }
+
+                return null;
+            }
+
+            extractFrameLabelFromSliderState(sliderState) {
+                if (!sliderState || !sliderState.node) {
+                    return null;
+                }
+
+                const node = sliderState.node;
+                const candidates = [
+                    node.getAttribute ? node.getAttribute('aria-valuetext') : '',
+                    node.getAttribute ? node.getAttribute('aria-label') : '',
+                    node.getAttribute ? node.getAttribute('title') : '',
+                    node.textContent
+                ];
+
                 const patterns = [
                     /\b(?:mon|tue|wed|thu|fri|sat|sun)\w*\s+\d{1,2}\s+\w{3},?\s+\d{1,2}:\d{2}\s*(?:am|pm)\b/i,
                     /\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i
                 ];
 
-                for (const candidate of candidates) {
-                    const text = String(candidate.textContent || '').replace(/\s+/g, ' ').trim();
+                for (const value of candidates) {
+                    const text = String(value || '').replace(/\s+/g, ' ').trim();
                     if (!text) {
                         continue;
                     }
@@ -1710,18 +1754,29 @@
                 return null;
             }
 
-            updateFrameTimeOverlay() {
+            updateFrameTimeOverlay(options = {}) {
                 if (!this.frameTimeOverlay || !this.frame || !this.frame.contentWindow) {
                     return;
                 }
 
                 try {
-                    const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
-                    const domLabel = this.extractFrameLabelFromDOM(frameDoc);
-                    let framePosition = this.extractFramePositionFromDOM(frameDoc);
-                    framePosition = this.updateLastFramePosition(framePosition) || framePosition;
+                    const fastMode = Boolean(options.fast);
+                    const frameDoc = options.frameDoc || this.frame.contentDocument || this.frame.contentWindow.document;
+                    const sliderState = this.findTimelineSliderState(frameDoc);
+                    const sliderPosition = sliderState
+                        ? { current: Number(sliderState.current), total: Number(sliderState.total) }
+                        : null;
+                    const domLabel =
+                        this.extractFrameLabelFromSliderState(sliderState) ||
+                        this.extractFrameLabelFromDOM(frameDoc);
+                    let framePosition = this.updateLastFramePosition(sliderPosition) || sliderPosition;
+                    if (!framePosition) {
+                        framePosition = this.extractFramePositionFromDOM(frameDoc);
+                        framePosition = this.updateLastFramePosition(framePosition) || framePosition;
+                    }
+
                     let fallbackLabel = null;
-                    if (!domLabel || !framePosition) {
+                    if (!fastMode && (!domLabel || !framePosition)) {
                         const frameEntries = this.collectResourceEntries()
                             .filter((entry) => entry && entry.name && entry.name.includes('/wmts/1.0.0/'))
                             .map((entry) => ({
@@ -1888,6 +1943,7 @@
                 if (moved) {
                     this.lastThrottledAnimationAt = now;
                     this.advanceLastFramePosition(this.frameSkip);
+                    this.updateFrameTimeOverlay({ fast: true, frameDoc: doc });
                 }
                 return moved;
             }
