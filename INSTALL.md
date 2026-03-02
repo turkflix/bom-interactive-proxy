@@ -39,6 +39,9 @@ curl -f http://localhost:8083/health
 - `http://HOST:8083/map-only?place=ashburton&zoom=8&showFrameTime=1`
 - `http://HOST:8083/test-harness`
 
+For the complete querystring reference (all options, aliases, defaults, and behavior), see:
+- `README.md` -> **Query Parameters**
+
 ## Home Assistant Dashboard Embed (iframe)
 
 ```yaml

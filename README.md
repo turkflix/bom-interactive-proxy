@@ -50,7 +50,7 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 - **Lean page-script policy (default):**
   - `/location/...` responses send a restrictive same-origin CSP and remove `Link` preconnect headers.
   - `/location/...` HTML is served with `Cache-Control: no-store` so stale pre-strip pages are not reused by the browser.
-  - A tiny inline bootstrap initializes `window.drupalSettings` from Drupal JSON and rewrites hardcoded `api.bom.gov.au`/`api.test2.bom.gov.au` calls back to local proxy origin.
+  - Injected local bootstrap script (`/inject-api-override.js`) initializes `window.drupalSettings` from Drupal JSON, prunes non-essential map overlays, and rewrites hardcoded `api.bom.gov.au`/`api.test2.bom.gov.au` calls back to local proxy origin.
   - Drupal aggregate JS bundles (`/sites/default/files/js/js_*.js`) remain enabled because BOM React runtime depends on data they provide.
   - BOM HTML is rewritten to disable non-essential external/tag scripts (`recaptcha`, `googletagmanager`, `gtag`, `gtm`).
   - Residual third-party telemetry/search URLs are rewritten to local `/blocked-external/...` `204` responses (including `go-mpulse`, BOM APM analytics, and Akamai script/pixel loaders).
@@ -60,67 +60,64 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 
 ## Query Parameters
 
-`/map-only` passes through supported parameters to `/map`.
+`/map-only` is a wrapper that always launches `/map` with:
+- `cleanup=1`
+- `mapOnly=1`
+- `rain=1`
 
-### Location Parameters
+It also forwards only a safe allowlist of user params:
+`path`, `place`, `name`, `lat`, `lon`, `lng`, `latitude`, `longitude`, `coords`, `zoom`, `lowPower`, `lowpower`, `animate`, `autoplay`, `animateMode`, `animatemode`, `animateInterval`, `animatems`, `frameSkip`, `frameskip`, `showFrameTime`, `showTime`.
 
-- `path=<bom-location-path>`
-  - Example:  
-    `/map-only?path=australia/victoria/central/o2594692629-ashburton`
-- `place=<name>` or `name=<name>`
-  - Example:  
-    `/map-only?place=ashburton`
-- `lat=<latitude>&lon=<longitude>`
-  - Aliases: `lng`, `latitude`, `longitude`
-  - Example:  
-    `/map-only?lat=-37.865&lon=145.081`
-- `coords=<lat,lon>`
-  - Example:  
-    `/map-only?coords=-37.865,145.081`
+`/map-only` does not forward `cleanup`, `mapOnly`, `rain`, or `mode`; use `/map` directly if you need to control those internals.
 
-If none are provided, default location is:
-`australia/victoria/central/o2594692629-ashburton`
+### Parameter Resolution Order
 
-### Display Parameters
+Location is resolved in this order:
+1. `path`
+2. `place` or `name`
+3. `lat/lon` (and aliases) or `coords`
+4. fallback: `australia/victoria/central/o2594692629-ashburton`
 
-- `showFrameTime=1|0` (alias: `showTime`)
-  - Default in `/map-only`: `1`
-  - Default in `/map`: `0`
-  - Overlay is shown at bottom-right.
-- `zoom=<integer>`
-  - Rounded and clamped to `0..20`.
-  - Higher values request a closer zoom-in view.
-  - Applied after map initialization with bounded best-effort control logic.
-- `animate=1|0` (alias: `autoplay=1|0`)
-  - Default in `/map-only`: `0` (paused / low-power mode)
-  - Default in `/map`: `1` (normal BOM behavior)
-  - Use `animate=1` if you want continuous looping animation.
-- `animateMode=native|throttle`
-  - Default: `native`
-  - `native`: use BOM's built-in autoplay (higher CPU on low-power devices).
-  - `throttle`: pause native autoplay and step frames at a fixed interval (lower CPU).
-- `animateInterval=<milliseconds>`
-  - Used when `animateMode=throttle`.
-  - Default: `2000`
-  - Range: `500..30000`
-- `frameSkip=<integer>`
-  - Used when `animateMode=throttle`.
-  - Number of frames advanced per step.
-  - Default: `1`
-  - Range: `1..6`
-- `lowPower=1|0`
-  - Forces low-bandwidth behavior:
-    - animation paused
-    - frame-time overlay disabled
-    - lighter cleanup loop
-  - Recommended for always-on dashboards and low-power devices.
+### Boolean Parsing Rules
 
-### Internal Mode Parameters
+Two boolean parsers are used:
+- Strict (`mapOnly`, `rain`, `cleanup`): only exact `1` means true.
+- Flexible (`animate`, `showFrameTime`, `lowPower`): false only for `0`, `false`, `off`, `no` (case-insensitive). Any other present value is treated as true.
 
-These are normally set by `/map-only`:
+### Full Parameter Reference (`/map`)
+
+| Parameter | Aliases | Type | Default on `/map` | Notes |
+|---|---|---|---|---|
+| `path` | none | string | none | Full BOM location path, e.g. `australia/victoria/central/o2594692629-ashburton`. If set, lookup by place/coords is skipped. |
+| `place` | `name` | string | none | Place name lookup using BOM autocomplete/details APIs. |
+| `lat` + `lon` | `latitude`, `longitude`, `lng` | numbers | none | Coordinate lookup when `path` and `place/name` are not supplied. |
+| `coords` | none | `lat,lon` string | none | Alternative coordinate input, e.g. `-37.865,145.081`. |
+| `zoom` | none | integer | none | Best-effort target zoom, rounded and clamped to `0..20`. Applied after initial map load. |
+| `showFrameTime` | `showTime` | boolean (flexible parser) | `0` unless `mapOnly=1` | Enables bottom-right frame/time badge. |
+| `animate` | `autoplay` | boolean (flexible parser) | `1` unless `mapOnly=1` | Controls timeline autoplay behavior. |
+| `animateMode` | `animatemode` | enum | `native` | `native` or throttled stepping. `throttle`, `throttled`, `step`, `stepped` all map to throttle mode. |
+| `animateInterval` | `animatems` | integer milliseconds | `2000` | Used in throttle mode. Clamped to `500..30000`. |
+| `frameSkip` | `frameskip` | integer | `1` | Used in throttle mode. Frames advanced per step. Clamped to `1..6`. |
+| `lowPower` | `lowpower` | boolean (flexible parser) | `0` | Forces reduced activity: disables animation and frame-time overlay, reduces cleanup cadence. |
+| `mapOnly` | `mode=maponly` | boolean (strict parser) | `0` | Enables map-only cleanup behavior and map-only defaults (`showFrameTime` default on, `animate` default off). |
+| `rain` | none | boolean (strict parser) | `0` | Forces the Rain tab workflow. |
+| `cleanup` | none | boolean (strict parser) | `0` | Enables repeated BOM chrome cleanup loop. |
+
+### Effective Defaults on `/map-only`
+
+Because `/map-only` injects internal flags, effective defaults are:
 - `mapOnly=1`
 - `rain=1`
 - `cleanup=1`
+- `showFrameTime=1` (unless `lowPower=1`)
+- `animate=0` (unless explicitly enabled and `lowPower=0`)
+
+### Examples
+
+- `/map-only?place=ashburton`
+- `/map-only?path=australia/victoria/central/o2594692629-ashburton&zoom=8`
+- `/map-only?coords=-37.865,145.081&zoom=10`
+- `/map-only?place=ashburton&animate=1&animateMode=throttle&animateInterval=2500&frameSkip=1&showFrameTime=1`
 
 ## Quick Start (Docker)
 
