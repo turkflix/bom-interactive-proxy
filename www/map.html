@@ -112,6 +112,8 @@
                 this.frameSkip = 1;
                 this.throttledAnimationTimer = null;
                 this.lastThrottledAnimationAt = 0;
+                this.lastFramePosition = null;
+                this.defaultFrameTotal = 6;
                 this.frameTimeOverlay = null;
                 this.frameTimeTimer = null;
                 this.frameTimeIntervalMs = 5000;
@@ -216,6 +218,10 @@
                     this.animateIntervalMs = animateIntervalMs;
                     this.frameSkip = frameSkip;
                     this.lastThrottledAnimationAt = 0;
+                    this.lastFramePosition = null;
+                    if (this.animate && this.animateMode === 'throttle') {
+                        this.lastFramePosition = { current: 1, total: this.defaultFrameTotal };
+                    }
                     this.setRequestedZoom(requestedZoom);
                     this.cleanupEnabled = cleanup || this.mapOnlyEnabled || this.forceRain;
                     this.playbackPaused = false;
@@ -1241,6 +1247,48 @@
                 return labelText ? `${labelText} ${frameText}` : frameText;
             }
 
+            normalizeFramePosition(position) {
+                if (!position) {
+                    return null;
+                }
+
+                const current = Math.round(Number(position.current));
+                const total = Math.round(Number(position.total));
+                if (!Number.isFinite(current) || !Number.isFinite(total) || total < 2) {
+                    return null;
+                }
+
+                if (current < 1 || current > total) {
+                    return null;
+                }
+
+                return { current, total };
+            }
+
+            updateLastFramePosition(position) {
+                const normalized = this.normalizeFramePosition(position);
+                if (!normalized) {
+                    return null;
+                }
+                this.lastFramePosition = normalized;
+                return normalized;
+            }
+
+            advanceLastFramePosition(steps) {
+                const currentState = this.normalizeFramePosition(this.lastFramePosition);
+                if (!currentState) {
+                    return null;
+                }
+
+                const increment = Math.max(1, Math.min(6, Math.round(Number(steps) || 1)));
+                const nextCurrent = ((currentState.current - 1 + increment) % currentState.total) + 1;
+                this.lastFramePosition = {
+                    current: nextCurrent,
+                    total: currentState.total
+                };
+                return this.lastFramePosition;
+            }
+
             collectResourceEntries() {
                 const entries = [];
                 const appendRecent = (sourceEntries) => {
@@ -1671,6 +1719,7 @@
                     const frameDoc = this.frame.contentDocument || this.frame.contentWindow.document;
                     const domLabel = this.extractFrameLabelFromDOM(frameDoc);
                     let framePosition = this.extractFramePositionFromDOM(frameDoc);
+                    framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                     let fallbackLabel = null;
                     if (!domLabel || !framePosition) {
                         const frameEntries = this.collectResourceEntries()
@@ -1687,8 +1736,17 @@
                             fallbackLabel = this.formatFrameTimestamp(latest);
                             if (!framePosition) {
                                 framePosition = this.extractFramePositionFromEntries(frameEntries);
+                                framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                             }
                         }
+                    }
+
+                    if (!framePosition) {
+                        framePosition = this.lastFramePosition;
+                    }
+                    if (!framePosition && this.shouldUseThrottledAnimation()) {
+                        framePosition = { current: 1, total: this.defaultFrameTotal };
+                        this.lastFramePosition = framePosition;
                     }
 
                     const overlayLabel = this.composeFrameOverlayLabel(domLabel || fallbackLabel, framePosition);
@@ -1815,6 +1873,13 @@
                     return false;
                 }
 
+                if (!this.lastFramePosition) {
+                    this.updateLastFramePosition(this.extractFramePositionFromDOM(doc));
+                    if (!this.lastFramePosition) {
+                        this.lastFramePosition = { current: 1, total: this.defaultFrameTotal };
+                    }
+                }
+
                 let moved = this.advanceTimelineBySteps(doc, this.frameSkip);
                 if (!moved) {
                     moved = this.pulseTimelinePlayback(doc);
@@ -1822,6 +1887,7 @@
 
                 if (moved) {
                     this.lastThrottledAnimationAt = now;
+                    this.advanceLastFramePosition(this.frameSkip);
                 }
                 return moved;
             }

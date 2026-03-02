@@ -68,15 +68,23 @@ else
     exit 1
 fi
 
-# Test 7: Location HTML rewrite guardrail (must not leak direct api.bom.gov.au)
+# Test 7: Location HTML rewrite guardrail (must not leak direct API hosts)
 echo "🧩 Testing location HTML rewrite..."
 LOC_HTML=$(curl -sS --compressed "${PROXY_URL}/location/australia/victoria/central/o2594692629-ashburton")
-if echo "$LOC_HTML" | rg -q "https://api\\.bom\\.gov\\.au|https:\\\\/\\\\/api\\.bom\\.gov\\.au"; then
-    echo "❌ Rewrite check failed (external api.bom.gov.au references still present)"
+if echo "$LOC_HTML" | rg -q "https://api\\.bom\\.gov\\.au|https:\\\\/\\\\/api\\.bom\\.gov\\.au|https://api\\.test2\\.bom\\.gov\\.au|https:\\\\/\\\\/api\\.test2\\.bom\\.gov\\.au"; then
+    echo "❌ Rewrite check failed (external BOM API host references still present)"
     exit 1
 fi
-if echo "$LOC_HTML" | rg -q "BULLETPROOF INLINE Override executing"; then
-    echo "✅ Rewrite guardrail passed (inline override present)"
+if echo "$LOC_HTML" | rg -Pq "<script[^>]*\\ssrc=['\"]https://(www\\.bom\\.gov\\.au/akam/|apm\\.analytics\\.bom\\.gov\\.au|s2?\\.go-mpulse\\.net/boomerang/|www\\.googletagmanager\\.com|www\\.google\\.com/recaptcha/|www\\.gstatic\\.com/recaptcha/)"; then
+    echo "❌ Rewrite check failed (external telemetry/anti-bot script sources still active)"
+    exit 1
+fi
+if ! echo "$LOC_HTML" | rg -Pq "<script[^>]*\\ssrc=['\"]/themes/custom/bom_theme/bom-react/dist/main\\.bundle\\.js"; then
+    echo "❌ Rewrite check failed (required BOM React main bundle missing)"
+    exit 1
+fi
+if echo "$LOC_HTML" | rg -Fq "API_HOST_RE=/https:\\/\\/api(?:\\.test2)?\\.bom\\.gov\\.au/g"; then
+    echo "✅ Rewrite guardrail passed (inline override present + external telemetry stripped)"
 else
     echo "❌ Rewrite guardrail failed (inline override marker missing)"
     exit 1

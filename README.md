@@ -14,6 +14,7 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 - Caches radar/tile frame endpoints locally in nginx to reduce repeated upstream BOM requests.
 - Sets browser cache for radar/tile frame endpoints to 60 seconds (`Cache-Control: public, max-age=60`).
 - Registers a browser service worker that caches map frame tiles for 60 seconds to reduce repeat frame fetches during animation loops.
+- Applies lean defaults for map-only use by disabling BOM tag-manager scripts and blocking third-party script loads inside proxied location pages.
 - Provides a browser test harness and health endpoint.
 - Includes Home Assistant custom App/Add-on repository packaging.
 
@@ -46,6 +47,16 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
   - `map-sw.js` intercepts WMTS/overlay/basemap tile image requests.
   - Returns cached tile responses for up to 60 seconds before refreshing.
   - This helps when animation loops revisit the same frame URLs.
+- **Lean page-script policy (default):**
+  - `/location/...` responses send a restrictive same-origin CSP and remove `Link` preconnect headers.
+  - `/location/...` HTML is served with `Cache-Control: no-store` so stale pre-strip pages are not reused by the browser.
+  - A tiny inline bootstrap initializes `window.drupalSettings` from Drupal JSON and rewrites hardcoded `api.bom.gov.au`/`api.test2.bom.gov.au` calls back to local proxy origin.
+  - Drupal aggregate JS bundles (`/sites/default/files/js/js_*.js`) remain enabled because BOM React runtime depends on data they provide.
+  - BOM HTML is rewritten to disable non-essential external/tag scripts (`recaptcha`, `googletagmanager`, `gtag`, `gtm`).
+  - Residual third-party telemetry/search URLs are rewritten to local `/blocked-external/...` `204` responses (including `go-mpulse`, BOM APM analytics, and Akamai script/pixel loaders).
+  - `/modules/contrib/google_tag/js/gtag.js` and `/modules/contrib/google_tag/js/gtm.js` are also served as no-op stubs as a fallback.
+  - Requests to `/akam/...` are dropped locally (`204`) to avoid loading non-map anti-bot assets in map-only mode.
+  - Non-map content widget APIs are served locally in map-only profile (`/api/v1/curated-alerts`, `/api/v1/global-alerts`, `/api/v1/nearby-news`, `/api/v1/webform/webform/*`) to avoid intermittent upstream anti-bot 403s.
 
 ## Query Parameters
 
