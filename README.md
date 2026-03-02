@@ -11,6 +11,7 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 - Rewrites host references so map assets load from one origin.
 - Serves a clean full-screen map page focused on rain radar.
 - Suppresses BOM hover popups and "view more at this location" overlays in map-only mode.
+- Keeps map-only view non-interactive by default (click/hover blocked) for kiosk/dashboard stability, with optional `interactive=1`.
 - Caches radar/tile frame endpoints locally in nginx to reduce repeated upstream BOM requests.
 - Sets browser cache for radar/tile frame endpoints to 60 seconds (`Cache-Control: public, max-age=60`).
 - Registers a browser service worker that caches map frame tiles for 60 seconds to reduce repeat frame fetches during animation loops.
@@ -73,7 +74,7 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 - `rain=1`
 
 It also forwards only a safe allowlist of user params:
-`path`, `place`, `name`, `lat`, `lon`, `lng`, `latitude`, `longitude`, `coords`, `zoom`, `lowPower`, `lowpower`, `animate`, `autoplay`, `animateMode`, `animatemode`, `animateInterval`, `animatems`, `frameSkip`, `frameskip`, `showFrameTime`, `showTime`.
+`path`, `place`, `name`, `lat`, `lon`, `lng`, `latitude`, `longitude`, `coords`, `zoom`, `zoomStart`, `zoomstart`, `zoomFrom`, `zoomfrom`, `lowPower`, `lowpower`, `animate`, `autoplay`, `animateMode`, `animatemode`, `animateInterval`, `animatems`, `frameSkip`, `frameskip`, `showFrameTime`, `showTime`, `interactive`, `interact`, `allowInteraction`, `allowinteraction`.
 
 `/map-only` does not forward `cleanup`, `mapOnly`, `rain`, or `mode`; use `/map` directly if you need to control those internals.
 
@@ -89,7 +90,7 @@ Location is resolved in this order:
 
 Two boolean parsers are used:
 - Strict (`mapOnly`, `rain`, `cleanup`): only exact `1` means true.
-- Flexible (`animate`, `showFrameTime`, `lowPower`): false only for `0`, `false`, `off`, `no` (case-insensitive). Any other present value is treated as true.
+- Flexible (`animate`, `showFrameTime`, `lowPower`, `interactive`): false only for `0`, `false`, `off`, `no` (case-insensitive). Any other present value is treated as true.
 
 ### Full Parameter Reference (`/map`)
 
@@ -99,8 +100,10 @@ Two boolean parsers are used:
 | `place` | `name` | string | none | Place name lookup using BOM autocomplete/details APIs. |
 | `lat` + `lon` | `latitude`, `longitude`, `lng` | numbers | none | Coordinate lookup when `path` and `place/name` are not supplied. |
 | `coords` | none | `lat,lon` string | none | Alternative coordinate input, e.g. `-37.865,145.081`. |
-| `zoom` | none | integer | none | Best-effort target zoom, rounded and clamped to `0..20`. Applied after initial map load. |
+| `zoom` | none | integer | none | Best-effort target zoom, rounded and clamped to `0..20`. In `/map-only`, values `>=20` are treated as "zoom to max available for this location", and the wrapper can keep the map hidden while zoom settles to avoid visible zoom-step effects. |
+| `zoomStart` | `zoomstart`, `zoomFrom`, `zoomfrom` | integer | none | Optional pre-target stage. If set and different from `zoom`, map first moves to `zoomStart`, then transitions to final `zoom`. Useful for a zoom-out reveal effect. Clamped to `0..20`. |
 | `showFrameTime` | `showTime` | boolean (flexible parser) | `0` unless `mapOnly=1` | Enables bottom-right frame/time badge. |
+| `interactive` | `interact`, `allowInteraction`, `allowinteraction` | boolean (flexible parser) | `0` | Re-enables map pointer input in `/map-only` so drag/pan works. Default remains non-interactive for stability. |
 | `animate` | `autoplay` | boolean (flexible parser) | `1` unless `mapOnly=1` | Controls timeline autoplay behavior. |
 | `animateMode` | `animatemode` | enum | `native` | `native` or throttled stepping. `throttle`, `throttled`, `step`, `stepped` all map to throttle mode. |
 | `animateInterval` | `animatems` | integer milliseconds | `2000` | Used in throttle mode. Clamped to `500..30000`. |
@@ -118,13 +121,16 @@ Because `/map-only` injects internal flags, effective defaults are:
 - `cleanup=1`
 - `showFrameTime=1` (unless `lowPower=1`)
 - `animate=0` (unless explicitly enabled and `lowPower=0`)
+- `interactive=0` (set `interactive=1` to allow drag/pan)
 
 ### Examples
 
 - `/map-only?place=ashburton`
 - `/map-only?path=australia/victoria/central/o2594692629-ashburton&zoom=8`
+- `/map-only?place=ashburton&zoom=9&zoomStart=12`
 - `/map-only?coords=-37.865,145.081&zoom=10`
 - `/map-only?place=ashburton&animate=1&animateMode=throttle&animateInterval=2500&frameSkip=1&showFrameTime=1`
+- `/map-only?place=ashburton&zoom=20&interactive=1`
 
 ## Quick Start (Docker)
 

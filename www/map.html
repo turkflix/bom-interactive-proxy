@@ -103,6 +103,7 @@
                 this.bomPath = null;
                 this.cleanupEnabled = false;
                 this.mapOnlyEnabled = false;
+                this.mapInteractionEnabled = false;
                 this.forceRain = false;
                 this.showFrameTime = false;
                 this.animate = true;
@@ -113,6 +114,8 @@
                 this.throttledAnimationTimer = null;
                 this.lastThrottledAnimationAt = 0;
                 this.lastFramePosition = null;
+                this.lastInternalFrameStepAt = 0;
+                this.lastObservedFrameLabel = '';
                 this.defaultFrameTotal = 6;
                 this.frameTimeOverlay = null;
                 this.frameTimeTimer = null;
@@ -124,25 +127,37 @@
                 this.maxPlaybackPauseAttempts = 30;
                 this.playbackLastActionAt = 0;
                 this.requestedZoom = null;
+                this.zoomFinalTarget = null;
+                this.zoomFinalTargetToMaximum = false;
+                this.zoomToMaximum = false;
+                this.zoomMaxAliasLevel = 20;
                 this.zoomLastActionAt = 0;
                 this.lastKnownZoom = null;
                 this.zoomFallbackBase = 7;
                 this.zoomVirtualLevel = 7;
                 this.zoomActionsTaken = 0;
-                this.zoomMaxActions = 20;
+                this.zoomMaxActions = 24;
                 this.zoomSessionStartedAt = 0;
                 this.zoomPendingDirection = 0;
                 this.zoomPendingSince = 0;
                 this.zoomPendingFrom = null;
-                this.zoomActionIntervalMs = 1200;
+                this.zoomActionIntervalMs = 700;
                 this.zoomWaitForChangeMs = 3500;
-                this.zoomSessionMaxDurationMs = 45000;
+                this.zoomSessionMaxDurationMs = 18000;
                 this.cleanupAttempts = 0;
                 this.maxCleanupAttempts = 60;
                 this.cleanupTimer = null;
                 this.renderNotified = false;
                 this.frameLoadHandled = false;
                 this.frameSoftLoadTimer = null;
+                this.rainTabActivated = false;
+                this.rainTabActivationAttempts = 0;
+                this.frameLoadedAt = 0;
+                this.frameVisible = false;
+                this.deferRevealUntilZoomSettled = false;
+                this.zoomRevealDeadline = 0;
+                this.zoomRevealMaxWaitMs = 20000;
+                this.zoomRevealPollTimer = null;
                 this.init();
             }
 
@@ -193,6 +208,16 @@
                     const animateIntervalParam = params.get('animateInterval') ?? params.get('animatems');
                     const frameSkipParam = params.get('frameSkip') ?? params.get('frameskip');
                     const showFrameTimeParam = params.get('showFrameTime') ?? params.get('showTime');
+                    const interactiveParam =
+                        params.get('interactive') ??
+                        params.get('interact') ??
+                        params.get('allowInteraction') ??
+                        params.get('allowinteraction');
+                    const zoomStartParam =
+                        params.get('zoomStart') ??
+                        params.get('zoomstart') ??
+                        params.get('zoomFrom') ??
+                        params.get('zoomfrom');
                     const lowPower =
                         lowPowerParam !== null &&
                         !['0', 'false', 'off', 'no'].includes(String(lowPowerParam).trim().toLowerCase());
@@ -204,12 +229,17 @@
                         animateParam === null
                             ? !mapOnly
                             : !['0', 'false', 'off', 'no'].includes(String(animateParam).trim().toLowerCase());
+                    const interactive =
+                        interactiveParam !== null &&
+                        !['0', 'false', 'off', 'no'].includes(String(interactiveParam).trim().toLowerCase());
                     const animateMode = this.parseAnimateMode(animateModeParam);
                     const animateIntervalMs = this.parseAnimateInterval(animateIntervalParam);
                     const frameSkip = this.parseFrameSkip(frameSkipParam);
                     const requestedZoom = this.parseRequestedZoom(params.get('zoom'));
+                    const requestedZoomStart = this.parseRequestedZoom(zoomStartParam);
                     this.bomPath = bomPath;
                     this.mapOnlyEnabled = mapOnly;
+                    this.mapInteractionEnabled = mapOnly && interactive;
                     this.forceRain = rain || mapOnly;
                     this.lowPower = lowPower;
                     this.showFrameTime = lowPower ? false : showFrameTime;
@@ -217,12 +247,19 @@
                     this.animateMode = animateMode;
                     this.animateIntervalMs = animateIntervalMs;
                     this.frameSkip = frameSkip;
+                    this.frameTimeIntervalMs = this.resolveFrameTimeIntervalMs();
                     this.lastThrottledAnimationAt = 0;
                     this.lastFramePosition = null;
+                    this.lastInternalFrameStepAt = 0;
+                    this.lastObservedFrameLabel = '';
                     if (this.animate && this.animateMode === 'throttle') {
                         this.lastFramePosition = { current: 1, total: this.defaultFrameTotal };
                     }
-                    this.setRequestedZoom(requestedZoom);
+                    this.setRequestedZoomPlan(requestedZoom, requestedZoomStart);
+                    this.deferRevealUntilZoomSettled = this.mapOnlyEnabled && Number.isFinite(requestedZoom);
+                    this.zoomRevealDeadline = this.deferRevealUntilZoomSettled
+                        ? Date.now() + this.zoomRevealMaxWaitMs
+                        : 0;
                     this.cleanupEnabled = cleanup || this.mapOnlyEnabled || this.forceRain;
                     this.playbackPaused = false;
                     this.playbackPauseAttempts = 0;
@@ -275,7 +312,7 @@
                     
                     // Timeout after 30 seconds
                     setTimeout(() => {
-                        if (this.loading.style.display !== 'none') {
+                        if (!this.frameLoadHandled && this.loading.style.display !== 'none') {
                             this.onFrameError('Timeout loading map');
                         }
                     }, 30000);
@@ -522,8 +559,26 @@
                 return Math.max(1, Math.min(6, parsed));
             }
 
-            setRequestedZoom(value) {
+            resolveFrameTimeIntervalMs() {
+                if (this.lowPower) {
+                    return 15000;
+                }
+
+                if (!this.animate) {
+                    return 5000;
+                }
+
+                if (this.shouldUseThrottledAnimation()) {
+                    const derived = Math.round(this.animateIntervalMs / 2);
+                    return Math.max(400, Math.min(1200, derived));
+                }
+
+                return 1000;
+            }
+
+            setRequestedZoom(value, options = {}) {
                 this.requestedZoom = Number.isFinite(value) ? value : null;
+                this.zoomToMaximum = this.requestedZoom !== null && Boolean(options.toMaximum);
                 this.zoomActionsTaken = 0;
                 this.zoomSessionStartedAt = this.requestedZoom === null ? 0 : Date.now();
                 this.zoomPendingDirection = 0;
@@ -534,14 +589,102 @@
                 this.zoomVirtualLevel = this.zoomFallbackBase;
             }
 
+            setRequestedZoomPlan(targetZoom, startZoom) {
+                this.zoomFinalTarget = null;
+                this.zoomFinalTargetToMaximum = false;
+                if (!Number.isFinite(targetZoom)) {
+                    this.clearRequestedZoom();
+                    return;
+                }
+
+                const finalToMaximum = targetZoom >= this.zoomMaxAliasLevel;
+                if (Number.isFinite(startZoom) && startZoom !== targetZoom) {
+                    this.zoomFinalTarget = targetZoom;
+                    this.zoomFinalTargetToMaximum = finalToMaximum;
+                    this.setRequestedZoom(startZoom, { toMaximum: false });
+                    return;
+                }
+
+                this.setRequestedZoom(targetZoom, { toMaximum: finalToMaximum });
+            }
+
+            promoteFinalZoomTarget() {
+                if (!Number.isFinite(this.zoomFinalTarget) || this.zoomFinalTarget === this.requestedZoom) {
+                    return false;
+                }
+
+                const nextTarget = this.zoomFinalTarget;
+                const nextTargetToMaximum = this.zoomFinalTargetToMaximum;
+                this.zoomFinalTarget = null;
+                this.zoomFinalTargetToMaximum = false;
+                this.setRequestedZoom(nextTarget, { toMaximum: nextTargetToMaximum });
+                return true;
+            }
+
             clearRequestedZoom() {
                 this.requestedZoom = null;
+                this.zoomFinalTarget = null;
+                this.zoomFinalTargetToMaximum = false;
+                this.zoomToMaximum = false;
                 this.zoomActionsTaken = 0;
                 this.zoomSessionStartedAt = 0;
                 this.zoomPendingDirection = 0;
                 this.zoomPendingSince = 0;
                 this.zoomPendingFrom = null;
                 this.zoomVirtualLevel = this.zoomFallbackBase;
+            }
+
+            isZoomPending() {
+                return this.requestedZoom !== null || Number.isFinite(this.zoomFinalTarget);
+            }
+
+            revealMapFrame() {
+                if (this.frameVisible) {
+                    return;
+                }
+                this.stopZoomRevealPoll();
+                this.loading.style.display = 'none';
+                this.frame.style.display = 'block';
+                this.frame.style.visibility = 'visible';
+                this.frameVisible = true;
+            }
+
+            hideMapFrameWhileZooming() {
+                this.frame.style.display = 'block';
+                this.frame.style.visibility = 'hidden';
+            }
+
+            startZoomRevealPoll() {
+                this.stopZoomRevealPoll();
+                this.zoomRevealPollTimer = setInterval(() => {
+                    this.maybeRevealMapFrameAfterZoom();
+                }, 500);
+            }
+
+            stopZoomRevealPoll() {
+                if (this.zoomRevealPollTimer) {
+                    clearInterval(this.zoomRevealPollTimer);
+                    this.zoomRevealPollTimer = null;
+                }
+            }
+
+            maybeRevealMapFrameAfterZoom() {
+                if (!this.deferRevealUntilZoomSettled || this.frameVisible) {
+                    return;
+                }
+
+                const now = Date.now();
+                const timedOut = this.zoomRevealDeadline > 0 && Date.now() >= this.zoomRevealDeadline;
+                const elapsedSinceLoad = this.frameLoadedAt > 0 ? now - this.frameLoadedAt : 0;
+                const cleanupSettled = this.cleanupEnabled && !this.cleanupTimer && this.cleanupAttempts > 0;
+                const stalled = cleanupSettled && elapsedSinceLoad >= 5000;
+                if (this.isZoomPending() && !timedOut && !stalled) {
+                    return;
+                }
+
+                this.deferRevealUntilZoomSettled = false;
+                this.zoomRevealDeadline = 0;
+                this.revealMapFrame();
             }
 
             onFrameLoad() {
@@ -556,10 +699,18 @@
                 }
 
                 console.log('BOM map loaded successfully');
-                
-                // Hide loading, show map
-                this.loading.style.display = 'none';
-                this.frame.style.display = 'block';
+                this.frameLoadedAt = Date.now();
+                this.frameVisible = false;
+                this.hideMapFrameWhileZooming();
+                if (this.deferRevealUntilZoomSettled) {
+                    const loadingMessage = this.loading.querySelector('div:last-child');
+                    if (loadingMessage) {
+                        loadingMessage.textContent = 'Applying map zoom...';
+                    }
+                    this.startZoomRevealPoll();
+                } else {
+                    this.revealMapFrame();
+                }
                 this.notifyParent('loaded');
 
                 if (this.showFrameTime) {
@@ -578,6 +729,8 @@
                     this.stopThrottledAnimationLoop();
                 }
 
+                this.maybeRevealMapFrameAfterZoom();
+
                 // Focus the frame for interactions
                 setTimeout(() => {
                     this.frame.focus();
@@ -594,10 +747,13 @@
                     clearInterval(this.frameSoftLoadTimer);
                     this.frameSoftLoadTimer = null;
                 }
+                this.stopZoomRevealPoll();
                 this.stopThrottledAnimationLoop();
                 this.stopFrameTimeOverlay();
                 this.stopViewMoreSuppression();
                 this.stopHoverSuppression();
+                this.frameVisible = false;
+                this.frame.style.visibility = 'hidden';
                 this.loading.style.display = 'none';
                 this.error.style.display = 'block';
                 this.error.querySelector('p').textContent = message;
@@ -617,8 +773,11 @@
 
                         mapRoot = this.findMapRoot(frameDoc);
 
-                        if (this.forceRain) {
-                            this.activateRainTab(frameDoc, mapRoot);
+                        if (this.forceRain && !this.rainTabActivated) {
+                            this.rainTabActivationAttempts += 1;
+                            if (this.activateRainTab(frameDoc, mapRoot)) {
+                                this.rainTabActivated = true;
+                            }
                         }
 
                         if (this.shouldPauseNativePlayback()) {
@@ -628,6 +787,7 @@
                         if (this.requestedZoom !== null) {
                             this.applyRequestedZoom(frameDoc);
                         }
+                        this.maybeRevealMapFrameAfterZoom();
 
                         const mapFound = this.cleanupBOMPage(frameDoc, mapRoot);
                         if (mapFound && !this.renderNotified) {
@@ -780,6 +940,41 @@
                         display: none !important;
                     }
                 `;
+                const tabUiRule = this.forceRain && !this.rainTabActivated
+                    ? ''
+                    : `
+                    [role="tablist"],
+                    [role="tab"],
+                    .tabs,
+                    .tablist,
+                    [class*="tab-list"] {
+                        display: none !important;
+                    }
+                `;
+                const mapInteractionRule = this.mapInteractionEnabled
+                    ? `
+                    .esri-view-root,
+                    .esri-view-surface,
+                    .esri-view-surface *,
+                    .mapboxgl-map,
+                    .leaflet-container,
+                    .ol-viewport {
+                        pointer-events: auto !important;
+                        cursor: grab !important;
+                    }
+                `
+                    : `
+                    /* Keep map-only dashboards non-interactive to avoid click-triggered black overlays/popups. */
+                    .esri-view-root,
+                    .esri-view-surface,
+                    .esri-view-surface *,
+                    .mapboxgl-map,
+                    .leaflet-container,
+                    .ol-viewport {
+                        pointer-events: none !important;
+                        cursor: default !important;
+                    }
+                `;
 
                 style.textContent = `
                     html, body {
@@ -793,11 +988,6 @@
 
                     #drupal-location-placeholder,
                     .preloader,
-                    [role="tablist"],
-                    [role="tab"],
-                    .tabs,
-                    .tablist,
-                    [class*="tab-list"],
                     [class*="quick-link"],
                     [class*="quickLinks"],
                     [class*="legend"],
@@ -845,6 +1035,10 @@
                         margin: 0 !important;
                         padding: 0 !important;
                     }
+
+                    ${mapInteractionRule}
+
+                    ${tabUiRule}
 
                     ${timelineRule}
                 `;
@@ -1025,7 +1219,11 @@
                 }
 
                 this.updateFrameTimeOverlay();
-                this.frameTimeTimer = setInterval(() => this.updateFrameTimeOverlay(), this.frameTimeIntervalMs);
+                const fastMode = this.animate && !this.lowPower && !this.shouldUseThrottledAnimation();
+                this.frameTimeTimer = setInterval(
+                    () => this.updateFrameTimeOverlay({ fast: fastMode }),
+                    this.frameTimeIntervalMs
+                );
             }
 
             stopFrameTimeOverlay() {
@@ -1399,16 +1597,95 @@
                 return rect.width > 0 && rect.height > 0;
             }
 
-            findZoomControlButton(doc, direction) {
-                const zoomIn = direction > 0;
+            isZoomControlDisabled(control) {
+                if (!control) {
+                    return true;
+                }
+
+                if (control.hasAttribute('disabled')) {
+                    return true;
+                }
+
+                const ariaDisabled = this.normalizeText(control.getAttribute('aria-disabled'));
+                if (ariaDisabled === 'true' || ariaDisabled === '1') {
+                    return true;
+                }
+
+                const className = this.normalizeText(control.className);
+                return /\b(esri-disabled|is-disabled|disabled)\b/.test(className);
+            }
+
+            resolveZoomButtonCandidate(candidate) {
+                if (!candidate) {
+                    return null;
+                }
+
+                if (candidate.tagName === 'BUTTON' || candidate.getAttribute('role') === 'button') {
+                    return candidate;
+                }
+
+                if (typeof candidate.closest === 'function') {
+                    return candidate.closest('button, [role="button"]');
+                }
+
+                return null;
+            }
+
+            findNamedZoomButton(doc, zoomIn) {
                 const selectors = zoomIn
                     ? [
                         '.esri-zoom__in-button',
-                        '.esri-zoom .esri-widget--button'
+                        '.esri-zoom [aria-label*="zoom in" i]',
+                        '.esri-zoom [title*="zoom in" i]',
+                        '.esri-zoom button[aria-label*="in" i]',
+                        '.esri-zoom button[title*="in" i]',
+                        'button[aria-label*="zoom in" i]',
+                        '[role="button"][aria-label*="zoom in" i]'
                     ]
                     : [
                         '.esri-zoom__out-button',
-                        '.esri-zoom .esri-widget--button'
+                        '.esri-zoom [aria-label*="zoom out" i]',
+                        '.esri-zoom [title*="zoom out" i]',
+                        '.esri-zoom button[aria-label*="out" i]',
+                        '.esri-zoom button[title*="out" i]',
+                        'button[aria-label*="zoom out" i]',
+                        '[role="button"][aria-label*="zoom out" i]'
+                    ];
+
+                for (const selector of selectors) {
+                    let raw = null;
+                    try {
+                        raw = doc.querySelector(selector);
+                    } catch (error) {
+                        continue;
+                    }
+
+                    const candidate = this.resolveZoomButtonCandidate(raw);
+                    if (!candidate || !this.isElementVisible(candidate) || this.isZoomControlDisabled(candidate)) {
+                        continue;
+                    }
+
+                    return candidate;
+                }
+
+                return null;
+            }
+
+            findZoomControlButton(doc, direction) {
+                const zoomIn = direction > 0;
+                const named = this.findNamedZoomButton(doc, zoomIn);
+                if (named) {
+                    return named;
+                }
+
+                const selectors = zoomIn
+                    ? [
+                        '.esri-zoom button',
+                        '.esri-zoom [role="button"]'
+                    ]
+                    : [
+                        '.esri-zoom button',
+                        '.esri-zoom [role="button"]'
                     ];
 
                 for (const selector of selectors) {
@@ -1431,7 +1708,7 @@
                     if (!label.includes(expectedLabel) && !label.includes(expectedSymbol)) {
                         continue;
                     }
-                    if (candidate.hasAttribute('disabled') || candidate.getAttribute('aria-disabled') === 'true') {
+                    if (this.isZoomControlDisabled(candidate)) {
                         continue;
                     }
                     return candidate;
@@ -1454,6 +1731,9 @@
 
                     const expected = zoomIn ? ['zoom in', '+'] : ['zoom out', '-'];
                     if (expected.some((token) => label.includes(token))) {
+                        if (this.isZoomControlDisabled(candidate)) {
+                            continue;
+                        }
                         return candidate;
                     }
                 }
@@ -1468,6 +1748,11 @@
 
                 if (typeof control.focus === 'function') {
                     control.focus();
+                }
+
+                if (typeof control.click === 'function') {
+                    control.click();
+                    return true;
                 }
 
                 try {
@@ -1578,6 +1863,9 @@
                     this.zoomActionsTaken >= this.zoomMaxActions ||
                     now - this.zoomSessionStartedAt > this.zoomSessionMaxDurationMs
                 ) {
+                    if (this.promoteFinalZoomTarget()) {
+                        return;
+                    }
                     console.warn('Requested zoom session ended before target was reached', {
                         target: this.requestedZoom,
                         lastKnownZoom: this.lastKnownZoom,
@@ -1594,8 +1882,56 @@
                 }
 
                 const observedZoom = Number.isFinite(currentZoom) ? currentZoom : this.lastKnownZoom;
-                if (Number.isFinite(observedZoom) && observedZoom === this.requestedZoom) {
+                if (!this.zoomToMaximum && Number.isFinite(observedZoom) && observedZoom === this.requestedZoom) {
+                    if (this.promoteFinalZoomTarget()) {
+                        return;
+                    }
                     this.clearRequestedZoom();
+                    return;
+                }
+
+                if (this.zoomToMaximum) {
+                    let zoomInControlAnyState = null;
+                    try {
+                        zoomInControlAnyState = doc.querySelector('.esri-zoom__in-button');
+                    } catch (error) {
+                        zoomInControlAnyState = null;
+                    }
+
+                    if (
+                        zoomInControlAnyState &&
+                        this.isElementVisible(zoomInControlAnyState) &&
+                        this.isZoomControlDisabled(zoomInControlAnyState)
+                    ) {
+                        if (this.promoteFinalZoomTarget()) {
+                            return;
+                        }
+                        this.clearRequestedZoom();
+                        return;
+                    }
+
+                    if (now - this.zoomLastActionAt < this.zoomActionIntervalMs) {
+                        return;
+                    }
+
+                    let actionApplied = false;
+                    const zoomControl = this.findNamedZoomButton(doc, true) || this.findZoomControlButton(doc, 1);
+                    if (zoomControl && this.activateZoomControl(zoomControl, doc)) {
+                        actionApplied = true;
+                    }
+
+                    if (!actionApplied) {
+                        return;
+                    }
+
+                    this.zoomLastActionAt = now;
+                    this.zoomActionsTaken += 1;
+                    this.zoomPendingDirection = 0;
+                    this.zoomPendingSince = 0;
+                    this.zoomPendingFrom = null;
+                    if (!Number.isFinite(observedZoom)) {
+                        this.zoomVirtualLevel = Math.max(0, Math.min(20, this.zoomVirtualLevel + 1));
+                    }
                     return;
                 }
 
@@ -1613,6 +1949,9 @@
                             this.zoomPendingSince = 0;
                             this.zoomPendingFrom = null;
                             if (observedZoom === this.requestedZoom) {
+                                if (this.promoteFinalZoomTarget()) {
+                                    return;
+                                }
                                 this.clearRequestedZoom();
                                 return;
                             }
@@ -1762,21 +2101,25 @@
                 try {
                     const fastMode = Boolean(options.fast);
                     const frameDoc = options.frameDoc || this.frame.contentDocument || this.frame.contentWindow.document;
-                    const sliderState = this.findTimelineSliderState(frameDoc);
+                    const throttledMode = this.shouldUseThrottledAnimation();
+                    const sliderState = throttledMode ? null : this.findTimelineSliderState(frameDoc);
                     const sliderPosition = sliderState
                         ? { current: Number(sliderState.current), total: Number(sliderState.total) }
                         : null;
                     const domLabel =
                         this.extractFrameLabelFromSliderState(sliderState) ||
                         this.extractFrameLabelFromDOM(frameDoc);
-                    let framePosition = this.updateLastFramePosition(sliderPosition) || sliderPosition;
-                    if (!framePosition) {
+                    let framePosition = throttledMode
+                        ? this.lastFramePosition
+                        : (this.updateLastFramePosition(sliderPosition) || sliderPosition);
+                    if (!throttledMode && !framePosition) {
                         framePosition = this.extractFramePositionFromDOM(frameDoc);
                         framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                     }
 
                     let fallbackLabel = null;
-                    if (!fastMode && (!domLabel || !framePosition)) {
+                    const preferEntrySignals = this.shouldUseThrottledAnimation();
+                    if ((!fastMode && (!domLabel || !framePosition)) || preferEntrySignals) {
                         const frameEntries = this.collectResourceEntries()
                             .filter((entry) => entry && entry.name && entry.name.includes('/wmts/1.0.0/'))
                             .map((entry) => ({
@@ -1788,9 +2131,22 @@
                         if (frameEntries.length) {
                             frameEntries.sort((a, b) => a.time - b.time);
                             const latest = frameEntries[frameEntries.length - 1].timestamp;
-                            fallbackLabel = this.formatFrameTimestamp(latest);
-                            if (!framePosition) {
-                                framePosition = this.extractFramePositionFromEntries(frameEntries);
+                            const entryLabel = this.formatFrameTimestamp(latest);
+                            const entryPosition = this.extractFramePositionFromEntries(frameEntries);
+
+                            if (preferEntrySignals) {
+                                fallbackLabel = entryLabel;
+                                // In throttled mode, keep x/y tied to the internal step counter.
+                                // WMTS request order can be noisy (prefetch/retries) and may look like 1/6.
+                                void entryPosition;
+                            } else {
+                                fallbackLabel = entryLabel;
+                                if (!framePosition && entryPosition) {
+                                    framePosition = entryPosition;
+                                }
+                            }
+
+                            if (framePosition) {
                                 framePosition = this.updateLastFramePosition(framePosition) || framePosition;
                             }
                         }
@@ -1804,7 +2160,31 @@
                         this.lastFramePosition = framePosition;
                     }
 
-                    const overlayLabel = this.composeFrameOverlayLabel(domLabel || fallbackLabel, framePosition);
+                    const effectiveLabel = domLabel || fallbackLabel || '';
+                    if (throttledMode) {
+                        const normalizedLabel = this.normalizeText(effectiveLabel);
+                        if (normalizedLabel) {
+                            const labelChanged =
+                                Boolean(this.lastObservedFrameLabel) &&
+                                normalizedLabel !== this.lastObservedFrameLabel;
+                            const sinceInternalStepMs = Date.now() - this.lastInternalFrameStepAt;
+                            const internalStepBudgetMs = Math.max(
+                                700,
+                                Math.min(4000, Math.round(this.animateIntervalMs * 0.8))
+                            );
+
+                            if (labelChanged && sinceInternalStepMs > internalStepBudgetMs) {
+                                const steppedPosition = this.advanceLastFramePosition(1);
+                                if (steppedPosition) {
+                                    framePosition = steppedPosition;
+                                }
+                            }
+
+                            this.lastObservedFrameLabel = normalizedLabel;
+                        }
+                    }
+
+                    const overlayLabel = this.composeFrameOverlayLabel(effectiveLabel, framePosition);
                     if (overlayLabel) {
                         this.frameTimeOverlay.textContent = overlayLabel;
                     }
@@ -1943,7 +2323,8 @@
                 if (moved) {
                     this.lastThrottledAnimationAt = now;
                     this.advanceLastFramePosition(this.frameSkip);
-                    this.updateFrameTimeOverlay({ fast: true, frameDoc: doc });
+                    this.lastInternalFrameStepAt = now;
+                    this.updateFrameTimeOverlay({ fast: false, frameDoc: doc });
                 }
                 return moved;
             }
