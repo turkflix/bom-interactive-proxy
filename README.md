@@ -74,7 +74,7 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
 - `rain=1`
 
 It also forwards only a safe allowlist of user params:
-`path`, `place`, `name`, `lat`, `lon`, `lng`, `latitude`, `longitude`, `coords`, `zoom`, `zoomStart`, `zoomstart`, `zoomFrom`, `zoomfrom`, `lowPower`, `lowpower`, `animate`, `autoplay`, `animateMode`, `animatemode`, `animateInterval`, `animatems`, `frameSkip`, `frameskip`, `showFrameTime`, `showTime`, `interactive`, `interact`, `allowInteraction`, `allowinteraction`.
+`path`, `place`, `name`, `lat`, `lon`, `lng`, `latitude`, `longitude`, `coords`, `zoom`, `zoomStart`, `zoomstart`, `zoomFrom`, `zoomfrom`, `lowPower`, `lowpower`, `animate`, `autoplay`, `animateMode`, `animatemode`, `animateInterval`, `animatems`, `frameSkip`, `frameskip`, `showFrameTime`, `showTime`, `showTownNames`, `townNames`, `townnames`, `townLabels`, `townlabels`, `towns`, `interactive`, `interact`, `allowInteraction`, `allowinteraction`.
 
 `/map-only` does not forward `cleanup`, `mapOnly`, `rain`, or `mode`; use `/map` directly if you need to control those internals.
 
@@ -90,7 +90,7 @@ Location is resolved in this order:
 
 Two boolean parsers are used:
 - Strict (`mapOnly`, `rain`, `cleanup`): only exact `1` means true.
-- Flexible (`animate`, `showFrameTime`, `lowPower`, `interactive`): false only for `0`, `false`, `off`, `no` (case-insensitive). Any other present value is treated as true.
+- Flexible (`animate`, `showFrameTime`, `showTownNames`, `lowPower`, `interactive`): false only for `0`, `false`, `off`, `no` (case-insensitive). Any other present value is treated as true.
 
 ### Full Parameter Reference (`/map`)
 
@@ -103,6 +103,7 @@ Two boolean parsers are used:
 | `zoom` | none | integer | none | Best-effort target zoom, rounded and clamped to `0..20`. In `/map-only`, values `>=20` are treated as "zoom to max available for this location", and the wrapper can keep the map hidden while zoom settles to avoid visible zoom-step effects. |
 | `zoomStart` | `zoomstart`, `zoomFrom`, `zoomfrom` | integer | none | Optional pre-target stage. If set and different from `zoom`, map first moves to `zoomStart`, then transitions to final `zoom`. Useful for a zoom-out reveal effect. Clamped to `0..20`. |
 | `showFrameTime` | `showTime` | boolean (flexible parser) | `0` unless `mapOnly=1` | Enables bottom-right frame/time badge. |
+| `showTownNames` | `townNames`, `townnames`, `townLabels`, `townlabels`, `towns` | boolean (flexible parser) | `0` | Keeps BOM town/city labels enabled. Label elements are forced non-clickable (`pointer-events: none`). |
 | `interactive` | `interact`, `allowInteraction`, `allowinteraction` | boolean (flexible parser) | `0` | Re-enables map pointer input in `/map-only` so drag/pan works. Default remains non-interactive for stability. |
 | `animate` | `autoplay` | boolean (flexible parser) | `1` unless `mapOnly=1` | Controls timeline autoplay behavior. |
 | `animateMode` | `animatemode` | enum | `native` | `native` or throttled stepping. `throttle`, `throttled`, `step`, `stepped` all map to throttle mode. |
@@ -120,6 +121,7 @@ Because `/map-only` injects internal flags, effective defaults are:
 - `rain=1`
 - `cleanup=1`
 - `showFrameTime=1` (unless `lowPower=1`)
+- `showTownNames=0` (set `showTownNames=1` to expose town labels)
 - `animate=0` (unless explicitly enabled and `lowPower=0`)
 - `interactive=0` (set `interactive=1` to allow drag/pan)
 
@@ -131,6 +133,7 @@ Because `/map-only` injects internal flags, effective defaults are:
 - `/map-only?coords=-37.865,145.081&zoom=10`
 - `/map-only?place=ashburton&animate=1&animateMode=throttle&animateInterval=2500&frameSkip=1&showFrameTime=1`
 - `/map-only?place=ashburton&zoom=20&interactive=1`
+- `/map-only?place=ashburton&showTownNames=1&interactive=1`
 
 ## Quick Start (Docker)
 

@@ -104,6 +104,9 @@
                 this.cleanupEnabled = false;
                 this.mapOnlyEnabled = false;
                 this.mapInteractionEnabled = false;
+                this.showTownNames = false;
+                this.townLayerEnableAttempts = 0;
+                this.maxTownLayerEnableAttempts = 60;
                 this.forceRain = false;
                 this.showFrameTime = false;
                 this.animate = true;
@@ -117,11 +120,18 @@
                 this.lastInternalFrameStepAt = 0;
                 this.lastObservedFrameLabel = '';
                 this.defaultFrameTotal = 6;
+                this.radarFrameTimeline = [];
+                this.radarFrameLayerIds = [
+                    'atm_surf_air_precip_reflectivity_dbz',
+                    'atm_surf_air_precip_rate_1hr_total_mm_h',
+                    'atm_surf_air_precip_accumulation_1hr_total_mm'
+                ];
                 this.frameTimeOverlay = null;
                 this.frameTimeTimer = null;
                 this.frameTimeIntervalMs = 5000;
                 this.viewMoreObserver = null;
                 this.hoverSuppressionCleanup = null;
+                this.mapClickSuppressionCleanup = null;
                 this.playbackPaused = false;
                 this.playbackPauseAttempts = 0;
                 this.maxPlaybackPauseAttempts = 30;
@@ -208,6 +218,13 @@
                     const animateIntervalParam = params.get('animateInterval') ?? params.get('animatems');
                     const frameSkipParam = params.get('frameSkip') ?? params.get('frameskip');
                     const showFrameTimeParam = params.get('showFrameTime') ?? params.get('showTime');
+                    const showTownNamesParam =
+                        params.get('showTownNames') ??
+                        params.get('townNames') ??
+                        params.get('townnames') ??
+                        params.get('townLabels') ??
+                        params.get('townlabels') ??
+                        params.get('towns');
                     const interactiveParam =
                         params.get('interactive') ??
                         params.get('interact') ??
@@ -225,13 +242,17 @@
                         showFrameTimeParam === null
                             ? mapOnly
                             : !['0', 'false', 'off', 'no'].includes(String(showFrameTimeParam).trim().toLowerCase());
+                    const showTownNames =
+                        showTownNamesParam !== null &&
+                        !['0', 'false', 'off', 'no'].includes(String(showTownNamesParam).trim().toLowerCase());
                     const animate =
                         animateParam === null
                             ? !mapOnly
                             : !['0', 'false', 'off', 'no'].includes(String(animateParam).trim().toLowerCase());
                     const interactive =
-                        interactiveParam !== null &&
-                        !['0', 'false', 'off', 'no'].includes(String(interactiveParam).trim().toLowerCase());
+                        interactiveParam === null
+                            ? showTownNames
+                            : !['0', 'false', 'off', 'no'].includes(String(interactiveParam).trim().toLowerCase());
                     const animateMode = this.parseAnimateMode(animateModeParam);
                     const animateIntervalMs = this.parseAnimateInterval(animateIntervalParam);
                     const frameSkip = this.parseFrameSkip(frameSkipParam);
@@ -240,6 +261,8 @@
                     this.bomPath = bomPath;
                     this.mapOnlyEnabled = mapOnly;
                     this.mapInteractionEnabled = mapOnly && interactive;
+                    this.showTownNames = showTownNames;
+                    this.persistTownLabelPreference();
                     this.forceRain = rain || mapOnly;
                     this.lowPower = lowPower;
                     this.showFrameTime = lowPower ? false : showFrameTime;
@@ -249,10 +272,17 @@
                     this.frameSkip = frameSkip;
                     this.frameTimeIntervalMs = this.resolveFrameTimeIntervalMs();
                     if (this.forceRain || this.shouldUseThrottledAnimation() || this.showFrameTime) {
-                        const discoveredFrameTotal = await this.resolveRadarFrameTotal();
-                        if (Number.isFinite(discoveredFrameTotal) && discoveredFrameTotal >= 2) {
-                            this.defaultFrameTotal = discoveredFrameTotal;
+                        const frameMetadata = await this.resolveRadarFrameMetadata();
+                        if (frameMetadata && Number.isFinite(frameMetadata.total) && frameMetadata.total >= 2) {
+                            this.defaultFrameTotal = frameMetadata.total;
+                            this.radarFrameTimeline = Array.isArray(frameMetadata.timeline)
+                                ? frameMetadata.timeline
+                                : [];
+                        } else {
+                            this.radarFrameTimeline = [];
                         }
+                    } else {
+                        this.radarFrameTimeline = [];
                     }
                     this.lastThrottledAnimationAt = 0;
                     this.lastFramePosition = null;
@@ -276,7 +306,13 @@
                     }
 
                     // Build the proxied BOM URL
-                    const bomUrl = `/location/${bomPath}`;
+                    const locationParams = new URLSearchParams();
+                    if (this.showTownNames) {
+                        locationParams.set('showTownNames', '1');
+                    }
+                    const bomUrl = locationParams.toString()
+                        ? `/location/${bomPath}?${locationParams.toString()}`
+                        : `/location/${bomPath}`;
                     
                     console.log('Loading BOM map from:', bomUrl);
                     
@@ -333,6 +369,21 @@
                 return String(path || '').trim().replace(/^\/+|\/+$/g, '');
             }
 
+            persistTownLabelPreference() {
+                try {
+                    window.localStorage.setItem('bomKeepTownLabels', this.showTownNames ? '1' : '0');
+                } catch (error) {
+                    // Ignore storage failures.
+                }
+
+                try {
+                    const maxAgeSeconds = 7 * 24 * 60 * 60;
+                    document.cookie = `bom_show_town_names=${this.showTownNames ? '1' : '0'}; Path=/; Max-Age=${maxAgeSeconds}; SameSite=Lax`;
+                } catch (error) {
+                    // Ignore cookie failures.
+                }
+            }
+
             slugify(value) {
                 return String(value || '')
                     .normalize('NFD')
@@ -382,6 +433,558 @@
                 }
 
                 return { lat: parsedLat, lon: parsedLon };
+            }
+
+            isArcGISViewCandidate(value) {
+                if (!value || typeof value !== 'object') {
+                    return false;
+                }
+
+                return (
+                    value.map &&
+                    typeof value.map.add === 'function' &&
+                    typeof value.goTo === 'function' &&
+                    typeof value.toScreen === 'function'
+                );
+            }
+
+            findArcGISView(frameDoc, mapRoot) {
+                const frameWin = frameDoc && frameDoc.defaultView ? frameDoc.defaultView : this.frame.contentWindow;
+                if (!frameWin) {
+                    return null;
+                }
+
+                const findViewInReactFiber = (node) => {
+                    if (!node || typeof node !== 'object') {
+                        return null;
+                    }
+
+                    let fiber = null;
+                    try {
+                        const ownNames = Object.getOwnPropertyNames(node);
+                        const reactFiberKey = ownNames.find((name) => name.startsWith('__reactFiber$'));
+                        fiber = reactFiberKey ? node[reactFiberKey] : null;
+                    } catch (error) {
+                        fiber = null;
+                    }
+
+                    if (!fiber) {
+                        return null;
+                    }
+
+                    const queue = [fiber];
+                    const seen = new Set();
+                    let steps = 0;
+                    const maxSteps = 6000;
+                    while (queue.length && steps < maxSteps) {
+                        const candidate = queue.shift();
+                        steps += 1;
+
+                        if (!candidate || (typeof candidate !== 'object' && typeof candidate !== 'function')) {
+                            continue;
+                        }
+
+                        if (seen.has(candidate)) {
+                            continue;
+                        }
+                        seen.add(candidate);
+
+                        if (this.isArcGISViewCandidate(candidate)) {
+                            return candidate;
+                        }
+
+                        let childKeys = [];
+                        try {
+                            childKeys = Object.getOwnPropertyNames(candidate);
+                        } catch (error) {
+                            childKeys = [];
+                        }
+
+                        for (const key of childKeys) {
+                            if (key === 'parentNode' || key === 'ownerDocument' || key === 'previousSibling' || key === 'nextSibling') {
+                                continue;
+                            }
+
+                            let child = null;
+                            try {
+                                child = candidate[key];
+                            } catch (error) {
+                                child = null;
+                            }
+
+                            if (!child || (typeof child !== 'object' && typeof child !== 'function')) {
+                                continue;
+                            }
+
+                            if (!seen.has(child)) {
+                                queue.push(child);
+                            }
+                        }
+                    }
+
+                    return null;
+                };
+
+                const domCandidates = [];
+                if (mapRoot) {
+                    domCandidates.push(mapRoot);
+                }
+
+                try {
+                    const queried = frameDoc.querySelectorAll('.esri-view-root, .esri-view, .esri-view-surface');
+                    domCandidates.push(...Array.from(queried));
+                } catch (error) {
+                    // ignore
+                }
+
+                const inspectNode = (node) => {
+                    if (!node || typeof node !== 'object') {
+                        return null;
+                    }
+
+                    if (this.isArcGISViewCandidate(node.__esri_view)) {
+                        return node.__esri_view;
+                    }
+
+                    const fiberView = findViewInReactFiber(node);
+                    if (this.isArcGISViewCandidate(fiberView)) {
+                        frameWin.__bomMapView = fiberView;
+                        return fiberView;
+                    }
+
+                    const keys = Object.keys(node);
+                    for (const key of keys) {
+                        const value = node[key];
+                        if (this.isArcGISViewCandidate(value)) {
+                            return value;
+                        }
+                    }
+
+                    return null;
+                };
+
+                for (const node of domCandidates) {
+                    const view = inspectNode(node);
+                    if (view) {
+                        return view;
+                    }
+                }
+
+                const globalCandidates = [
+                    frameWin.view,
+                    frameWin.mapView,
+                    frameWin.weatherMapView,
+                    frameWin.__view,
+                    frameWin.__mapView,
+                    frameWin.__bomMapView
+                ];
+                for (const candidate of globalCandidates) {
+                    if (this.isArcGISViewCandidate(candidate)) {
+                        return candidate;
+                    }
+                }
+
+                try {
+                    const windowKeys = Object.keys(frameWin);
+                    for (const key of windowKeys) {
+                        const value = frameWin[key];
+                        if (this.isArcGISViewCandidate(value)) {
+                            return value;
+                        }
+                    }
+                } catch (error) {
+                    // ignore
+                }
+
+                return null;
+            }
+
+            maybeEnableTownOverlay(frameDoc, mapRoot) {
+                if (!this.showTownNames || !frameDoc) {
+                    return false;
+                }
+
+                const frameWin = frameDoc.defaultView || this.frame.contentWindow;
+                if (!frameWin) {
+                    return false;
+                }
+
+                if (frameWin.__bomTownLayerInjecting) {
+                    return true;
+                }
+
+                if (this.townLayerEnableAttempts >= this.maxTownLayerEnableAttempts) {
+                    return false;
+                }
+
+                this.townLayerEnableAttempts += 1;
+                const view = this.findArcGISView(frameDoc, mapRoot);
+                if (!view || !view.map || typeof view.map.add !== 'function') {
+                    return false;
+                }
+
+                const ensureDoubleClickDisabled = () => {
+                    if (!frameWin.__bomDoubleClickDomHandler && frameDoc && typeof frameDoc.addEventListener === 'function') {
+                        const domHandler = (event) => {
+                            if (!event || event.type !== 'dblclick' || event.isTrusted !== true) {
+                                return;
+                            }
+
+                            const target = event.target;
+                            if (!target || typeof target.closest !== 'function') {
+                                return;
+                            }
+
+                            const inMapViewport = Boolean(
+                                target.closest('.esri-view-root, .esri-view, .esri-view-surface, .mapboxgl-map, .leaflet-container, .ol-viewport')
+                            );
+                            if (!inMapViewport) {
+                                return;
+                            }
+
+                            event.preventDefault();
+                            if (typeof event.stopImmediatePropagation === 'function') {
+                                event.stopImmediatePropagation();
+                            }
+                            event.stopPropagation();
+                        };
+
+                        frameDoc.addEventListener('dblclick', domHandler, true);
+                        frameWin.__bomDoubleClickDomHandler = domHandler;
+                    }
+
+                    if (!frameWin.__bomDoubleClickViewHandlers && typeof view.on === 'function') {
+                        const stopViewDoubleClick = (event) => {
+                            const nativeEvent = event && (event.native || event.nativeEvent) ? (event.native || event.nativeEvent) : null;
+                            if (nativeEvent && nativeEvent.isTrusted === false) {
+                                return;
+                            }
+
+                            if (event && typeof event.stopPropagation === 'function') {
+                                event.stopPropagation();
+                            }
+                            if (event && typeof event.preventDefault === 'function') {
+                                event.preventDefault();
+                            }
+                        };
+
+                        const handles = [];
+                        try {
+                            const handle = view.on('double-click', stopViewDoubleClick);
+                            if (handle) {
+                                handles.push(handle);
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+                        try {
+                            const handle = view.on('double-click', ['Control'], stopViewDoubleClick);
+                            if (handle) {
+                                handles.push(handle);
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+
+                        frameWin.__bomDoubleClickViewHandlers = handles;
+                    }
+                };
+
+                ensureDoubleClickDisabled();
+
+                const ensureSingleClickDisabled = () => {
+                    if (frameWin.__bomClickViewHandlers || typeof view.on !== 'function') {
+                        return;
+                    }
+
+                    const stopViewClick = (event) => {
+                        const nativeEvent = event && (event.native || event.nativeEvent)
+                            ? (event.native || event.nativeEvent)
+                            : null;
+                        if (nativeEvent && nativeEvent.isTrusted === false) {
+                            return;
+                        }
+
+                        if (event && typeof event.stopPropagation === 'function') {
+                            event.stopPropagation();
+                        }
+                        if (event && typeof event.preventDefault === 'function') {
+                            event.preventDefault();
+                        }
+                    };
+
+                    const handles = [];
+                    const eventTypes = ['click', 'immediate-click', 'hold'];
+                    for (const eventType of eventTypes) {
+                        try {
+                            const handle = view.on(eventType, stopViewClick);
+                            if (handle) {
+                                handles.push(handle);
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+                    }
+
+                    frameWin.__bomClickViewHandlers = handles;
+                };
+
+                ensureSingleClickDisabled();
+
+                const forceExistingTownLayers = () => {
+                    let touched = false;
+                    let hasTownPlacesGraphic = false;
+                    const ensureTownHitTestFilter = () => {
+                        if (frameWin.__bomTownHitTestPatched || !view || typeof view.hitTest !== 'function') {
+                            return;
+                        }
+
+                        const isTownHitResult = (entry) => {
+                            if (!entry || typeof entry !== 'object') {
+                                return false;
+                            }
+
+                            const graphic = entry.graphic && typeof entry.graphic === 'object' ? entry.graphic : null;
+                            const layer = graphic && graphic.layer ? graphic.layer : null;
+                            const marker = `${layer && layer.id ? layer.id : ''}|${layer && layer.title ? layer.title : ''}|${layer && layer.url ? layer.url : ''}`.toLowerCase();
+                            if (
+                                marker.includes('overlay_3187') ||
+                                marker.includes('towns_and_cities') ||
+                                marker.includes('townplacesgraphic')
+                            ) {
+                                return true;
+                            }
+
+                            const attributes = graphic && graphic.attributes && typeof graphic.attributes === 'object'
+                                ? graphic.attributes
+                                : null;
+                            if (!attributes) {
+                                return false;
+                            }
+
+                            return (
+                                Object.prototype.hasOwnProperty.call(attributes, 'PROPER_NAME') &&
+                                Object.prototype.hasOwnProperty.call(attributes, 'MIN_ZOOM_LVL')
+                            );
+                        };
+
+                        const nativeHitTest = view.hitTest.bind(view);
+                        view.hitTest = function (...args) {
+                            const result = nativeHitTest(...args);
+                            return Promise.resolve(result).then((hit) => {
+                                if (!hit || !Array.isArray(hit.results)) {
+                                    return hit;
+                                }
+
+                                const filtered = hit.results.filter((entry) => !isTownHitResult(entry));
+                                if (filtered.length === hit.results.length) {
+                                    return hit;
+                                }
+
+                                try {
+                                    hit.results = filtered;
+                                    return hit;
+                                } catch (error) {
+                                    return Object.assign({}, hit, { results: filtered });
+                                }
+                            });
+                        };
+
+                        frameWin.__bomTownHitTestPatched = true;
+                    };
+
+                    ensureTownHitTestFilter();
+
+                    if (!view || !view.map || !view.map.layers || typeof view.map.layers.forEach !== 'function') {
+                        return false;
+                    }
+
+                    view.map.layers.forEach((layer) => {
+                        if (!layer) {
+                            return;
+                        }
+
+                        const layerId = `${layer.id || ''}`.toLowerCase();
+                        const marker = `${layer.id || ''}|${layer.title || ''}|${layer.url || ''}`.toLowerCase();
+
+                        if (layerId.includes('townplacesgraphic')) {
+                            hasTownPlacesGraphic = true;
+                            try {
+                                layer.visible = true;
+                            } catch (error) {
+                                // ignore
+                            }
+                            try {
+                                if ('popupEnabled' in layer) {
+                                    layer.popupEnabled = false;
+                                }
+                            } catch (error) {
+                                // ignore
+                            }
+                            try {
+                                if ('cursorPointerOnHover' in layer) {
+                                    layer.cursorPointerOnHover = false;
+                                }
+                            } catch (error) {
+                                // ignore
+                            }
+                            try {
+                                if ('isInteractive' in layer) {
+                                    layer.isInteractive = false;
+                                }
+                            } catch (error) {
+                                // ignore
+                            }
+                            touched = true;
+                            return;
+                        }
+
+                        const isTownLayer =
+                            marker.includes('overlay_3187') ||
+                            marker.includes('towns_and_cities') ||
+                            marker.includes('towns and cities');
+                        if (!isTownLayer) {
+                            return;
+                        }
+
+                        try {
+                            layer.visible = false;
+                        } catch (error) {
+                            // ignore
+                        }
+                        try {
+                            if ('popupEnabled' in layer) {
+                                layer.popupEnabled = false;
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+                        try {
+                            if ('cursorPointerOnHover' in layer) {
+                                layer.cursorPointerOnHover = false;
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+                        try {
+                            if ('isInteractive' in layer) {
+                                layer.isInteractive = false;
+                            }
+                        } catch (error) {
+                            // ignore
+                        }
+
+                        touched = true;
+                    });
+
+                    if (touched && hasTownPlacesGraphic) {
+                        frameWin.__bomTownLayerInjected = true;
+                    }
+
+                    return touched;
+                };
+
+                forceExistingTownLayers();
+
+                if (!frameWin.__bomTownLayerGuardTimer && typeof frameWin.setInterval === 'function') {
+                    frameWin.__bomTownLayerGuardTimer = frameWin.setInterval(() => {
+                        forceExistingTownLayers();
+                    }, 1000);
+                }
+
+                if (frameWin.__bomTownLayerInjected) {
+                    return true;
+                }
+
+                const ensureLayer = (FeatureLayerCtor) => {
+                    if (!FeatureLayerCtor) {
+                        return false;
+                    }
+
+                    const existingLayer =
+                        (typeof view.map.findLayerById === 'function' && view.map.findLayerById('bom-town-labels-override')) ||
+                        null;
+                    if (existingLayer) {
+                        existingLayer.visible = true;
+                        existingLayer.popupEnabled = false;
+                        existingLayer.labelsVisible = true;
+                        frameWin.__bomTownLayerInjected = true;
+                        frameWin.__bomTownLayerInjecting = false;
+                        return true;
+                    }
+
+                    const townLayer = new FeatureLayerCtor({
+                        id: 'bom-town-labels-override',
+                        title: 'Towns and cities',
+                        url: '/overlays/towns_and_cities/FeatureServer/3',
+                        outFields: ['NAME', 'MIN_ZOOM_LVL'],
+                        legendEnabled: false,
+                        listMode: 'hide',
+                        popupEnabled: false,
+                        labelsVisible: true,
+                        minScale: 0,
+                        maxScale: 0,
+                        renderer: {
+                            type: 'simple',
+                            symbol: {
+                                type: 'simple-marker',
+                                style: 'circle',
+                                size: 1,
+                                color: [0, 0, 0, 0],
+                                outline: {
+                                    color: [0, 0, 0, 0],
+                                    width: 0
+                                }
+                            }
+                        },
+                        labelingInfo: [
+                            {
+                                labelPlacement: 'above-center',
+                                deconflictionStrategy: 'static',
+                                labelExpressionInfo: {
+                                    expression: '$feature.NAME'
+                                },
+                                symbol: {
+                                    type: 'text',
+                                    color: [255, 255, 255, 1],
+                                    haloColor: [0, 0, 0, 1],
+                                    haloSize: 1.5,
+                                    font: {
+                                        family: 'Arial',
+                                        size: 11,
+                                        weight: 'bold'
+                                    }
+                                }
+                            }
+                        ]
+                    });
+
+                    view.map.add(townLayer);
+                    frameWin.__bomTownLayerInjected = true;
+                    frameWin.__bomTownLayerInjecting = false;
+                    forceExistingTownLayers();
+                    return true;
+                };
+
+                try {
+                    frameWin.__bomTownLayerInjecting = true;
+                    if (frameWin.esri && frameWin.esri.layers && frameWin.esri.layers.FeatureLayer) {
+                        return ensureLayer(frameWin.esri.layers.FeatureLayer);
+                    }
+
+                    if (typeof frameWin.require === 'function') {
+                        frameWin.require(['esri/layers/FeatureLayer'], (FeatureLayerCtor) => {
+                            ensureLayer(FeatureLayerCtor);
+                        }, () => {
+                            frameWin.__bomTownLayerInjecting = false;
+                        });
+                        return true;
+                    }
+                } catch (error) {
+                    frameWin.__bomTownLayerInjecting = false;
+                }
+
+                return false;
             }
 
             async fetchJSON(url) {
@@ -565,7 +1168,7 @@
                 return Math.max(1, Math.min(6, parsed));
             }
 
-            async resolveRadarFrameTotal() {
+            async resolveRadarFrameMetadata() {
                 const capabilitiesUrl = '/timeseries/wmts?service=WMTS&request=GetCapabilities';
                 try {
                     const response = await fetch(capabilitiesUrl, {
@@ -584,13 +1187,32 @@
                         return null;
                     }
 
-                    const values = layerMatch[1].match(/<Value>/g) || [];
-                    const total = values.length;
+                    const rawValues = Array.from(layerMatch[1].matchAll(/<Value>([^<]+)<\/Value>/gi))
+                        .map((match) => String(match[1] || '').trim())
+                        .filter(Boolean);
+                    if (!rawValues.length) {
+                        return null;
+                    }
+
+                    const timeline = Array.from(
+                        new Set(
+                            rawValues
+                                .map((value) => ({ value, ms: Date.parse(value) }))
+                                .filter((item) => Number.isFinite(item.ms))
+                                .sort((a, b) => a.ms - b.ms)
+                                .map((item) => item.value)
+                        )
+                    );
+
+                    const total = timeline.length;
                     if (!Number.isFinite(total) || total < 2) {
                         return null;
                     }
 
-                    return Math.max(2, Math.min(24, total));
+                    return {
+                        total: Math.max(2, Math.min(24, total)),
+                        timeline
+                    };
                 } catch (error) {
                     return null;
                 }
@@ -789,6 +1411,7 @@
                 this.stopFrameTimeOverlay();
                 this.stopViewMoreSuppression();
                 this.stopHoverSuppression();
+                this.stopMapClickSuppression();
                 this.frameVisible = false;
                 this.frame.style.visibility = 'hidden';
                 this.loading.style.display = 'none';
@@ -825,6 +1448,9 @@
                             this.applyRequestedZoom(frameDoc);
                         }
                         this.maybeRevealMapFrameAfterZoom();
+                        if (this.showTownNames) {
+                            this.maybeEnableTownOverlay(frameDoc, mapRoot);
+                        }
 
                         const mapFound = this.cleanupBOMPage(frameDoc, mapRoot);
                         if (mapFound && !this.renderNotified) {
@@ -933,6 +1559,7 @@
 
                     if (mapRoot && this.mapOnlyEnabled) {
                         this.setupViewMoreSuppression(doc);
+                        this.setupMapClickSuppression(doc);
                         this.isolateToNode(doc, mapRoot);
                     }
 
@@ -1012,6 +1639,23 @@
                         cursor: default !important;
                     }
                 `;
+                const townLabelSelectors = `
+                    [id*="overlay_3187"],
+                    [class*="overlay_3187"],
+                    [id*="towns_and_cities"],
+                    [class*="towns_and_cities"],
+                    [data-layer-id*="towns_and_cities"],
+                    [data-overlay-id*="towns_and_cities"]
+                `;
+                const townLabelsRule = this.showTownNames
+                    ? `
+                    ${townLabelSelectors},
+                    ${townLabelSelectors} * {
+                        pointer-events: none !important;
+                        cursor: default !important;
+                    }
+                `
+                    : '';
 
                 style.textContent = `
                     html, body {
@@ -1041,12 +1685,6 @@
                     .esri-popup__footer,
                     .esri-popup__button,
                     .esri-popup__header,
-                    .esri-features,
-                    .esri-feature,
-                    .esri-callout,
-                    [role="tooltip"],
-                    [class*="tooltip"],
-                    [class*="popover"],
                     [class*="view-more"][class*="location"] {
                         display: none !important;
                     }
@@ -1078,6 +1716,8 @@
                     ${tabUiRule}
 
                     ${timelineRule}
+
+                    ${townLabelsRule}
                 `;
             }
 
@@ -1091,7 +1731,7 @@
                 const hideViewMoreElements = () => {
                     const popupContainers = Array.from(
                         doc.querySelectorAll(
-                            '.esri-popup, .esri-features, [role="dialog"], [role="tooltip"], [class*="popup"], [class*="callout"], [class*="tooltip"], [class*="popover"]'
+                            '.esri-popup, [role="dialog"], [class*="popup"], [class*="callout"]'
                         )
                     );
                     for (const container of popupContainers) {
@@ -1181,7 +1821,7 @@
 
                     return Boolean(
                         target.closest(
-                            '.esri-view-root, .esri-view, .esri-view-surface, .mapboxgl-map, .leaflet-container, .ol-viewport, .esri-popup, .esri-features, [role="tooltip"], [class*="popup"], [class*="tooltip"], [class*="callout"], [class*="popover"]'
+                            '.esri-view-root, .esri-view, .esri-view-surface, .mapboxgl-map, .leaflet-container, .ol-viewport, .esri-popup, [role="dialog"], [class*="popup"], [class*="callout"]'
                         )
                     );
                 };
@@ -1217,11 +1857,226 @@
                 };
             }
 
+            setupMapClickSuppression(doc) {
+                if (this.mapClickSuppressionCleanup) {
+                    return;
+                }
+
+                const isControlTarget = (target) => {
+                    if (!target || typeof target.closest !== 'function') {
+                        return false;
+                    }
+
+                    return Boolean(
+                        target.closest(
+                            '.esri-zoom, .esri-widget--button, button, [role="button"], [role="slider"], a, input, select, textarea, label'
+                        )
+                    );
+                };
+
+                const isMapContext = (target) => {
+                    if (!target || typeof target.closest !== 'function') {
+                        return false;
+                    }
+
+                    return Boolean(
+                        target.closest(
+                            '.esri-view-root, .esri-view, .esri-view-surface, .mapboxgl-map, .leaflet-container, .ol-viewport'
+                        )
+                    );
+                };
+
+                const isBlockedInteractionHref = (target) => {
+                    if (!target || typeof target.closest !== 'function') {
+                        return false;
+                    }
+
+                    const link = target.closest('a[href]');
+                    if (!link) {
+                        return false;
+                    }
+
+                    const rawHref = link.getAttribute('href') || link.href || '';
+                    if (!rawHref) {
+                        return false;
+                    }
+
+                    try {
+                        const baseHref =
+                            (doc && doc.location && doc.location.href) ||
+                            window.location.href;
+                        const parsed = new URL(rawHref, baseHref);
+                        const pathname = String(parsed.pathname || '').toLowerCase();
+                        return (
+                            pathname === '/apikey/v1/locations/places/search' ||
+                            pathname.startsWith('/apikey/v1/observations/recent/')
+                        );
+                    } catch (error) {
+                        return false;
+                    }
+                };
+
+                const shouldHandleAsMapClick = (event) => {
+                    if (!event || event.isTrusted !== true) {
+                        return false;
+                    }
+
+                    const target = event.target;
+                    if (!isMapContext(target)) {
+                        return false;
+                    }
+
+                    if (isBlockedInteractionHref(target)) {
+                        return true;
+                    }
+
+                    if (isControlTarget(target)) {
+                        return false;
+                    }
+
+                    return true;
+                };
+
+                let activePointer = null;
+                let blockNextClick = false;
+                let blockNextClickResetTimer = null;
+                const maxClickTravelPx = 8;
+
+                const resetBlockNextClick = () => {
+                    if (blockNextClickResetTimer) {
+                        clearTimeout(blockNextClickResetTimer);
+                        blockNextClickResetTimer = null;
+                    }
+                    blockNextClick = false;
+                };
+
+                const blockMapEvent = (event) => {
+                    if (!event) {
+                        return;
+                    }
+                    if (typeof event.preventDefault === 'function') {
+                        event.preventDefault();
+                    }
+                    if (typeof event.stopImmediatePropagation === 'function') {
+                        event.stopImmediatePropagation();
+                    }
+                    event.stopPropagation();
+                };
+
+                const onPointerDown = (event) => {
+                    if (!shouldHandleAsMapClick(event)) {
+                        return;
+                    }
+
+                    const button = typeof event.button === 'number' ? event.button : 0;
+                    if (button !== 0) {
+                        return;
+                    }
+
+                    activePointer = {
+                        id: typeof event.pointerId === 'number' ? event.pointerId : null,
+                        startX: Number.isFinite(event.clientX) ? event.clientX : 0,
+                        startY: Number.isFinite(event.clientY) ? event.clientY : 0,
+                        moved: false
+                    };
+                };
+
+                const onPointerMove = (event) => {
+                    if (!activePointer) {
+                        return;
+                    }
+                    if (activePointer.id !== null && typeof event.pointerId === 'number' && event.pointerId !== activePointer.id) {
+                        return;
+                    }
+
+                    const x = Number.isFinite(event.clientX) ? event.clientX : activePointer.startX;
+                    const y = Number.isFinite(event.clientY) ? event.clientY : activePointer.startY;
+                    const distance = Math.hypot(x - activePointer.startX, y - activePointer.startY);
+                    if (distance > maxClickTravelPx) {
+                        activePointer.moved = true;
+                    }
+                };
+
+                const onPointerEnd = (event) => {
+                    if (!activePointer) {
+                        return;
+                    }
+                    if (activePointer.id !== null && typeof event.pointerId === 'number' && event.pointerId !== activePointer.id) {
+                        return;
+                    }
+
+                    const suppressAsClick = !activePointer.moved && shouldHandleAsMapClick(event);
+                    activePointer = null;
+
+                    if (!suppressAsClick) {
+                        return;
+                    }
+
+                    blockNextClick = true;
+                    if (blockNextClickResetTimer) {
+                        clearTimeout(blockNextClickResetTimer);
+                    }
+                    blockNextClickResetTimer = setTimeout(() => {
+                        blockNextClick = false;
+                        blockNextClickResetTimer = null;
+                    }, 400);
+
+                    blockMapEvent(event);
+                };
+
+                const onClick = (event) => {
+                    if (!shouldHandleAsMapClick(event)) {
+                        return;
+                    }
+
+                    if (isBlockedInteractionHref(event.target)) {
+                        resetBlockNextClick();
+                        blockMapEvent(event);
+                        return;
+                    }
+
+                    if (!blockNextClick) {
+                        return;
+                    }
+
+                    resetBlockNextClick();
+                    blockMapEvent(event);
+                };
+
+                doc.addEventListener('pointerdown', onPointerDown, true);
+                doc.addEventListener('pointermove', onPointerMove, true);
+                doc.addEventListener('pointerup', onPointerEnd, true);
+                doc.addEventListener('pointercancel', onPointerEnd, true);
+                doc.addEventListener('click', onClick, true);
+                doc.addEventListener('auxclick', onClick, true);
+                this.mapClickSuppressionCleanup = () => {
+                    if (blockNextClickResetTimer) {
+                        clearTimeout(blockNextClickResetTimer);
+                        blockNextClickResetTimer = null;
+                    }
+                    activePointer = null;
+                    blockNextClick = false;
+                    doc.removeEventListener('pointerdown', onPointerDown, true);
+                    doc.removeEventListener('pointermove', onPointerMove, true);
+                    doc.removeEventListener('pointerup', onPointerEnd, true);
+                    doc.removeEventListener('pointercancel', onPointerEnd, true);
+                    doc.removeEventListener('click', onClick, true);
+                    doc.removeEventListener('auxclick', onClick, true);
+                };
+            }
+
             stopHoverSuppression() {
                 if (typeof this.hoverSuppressionCleanup === 'function') {
                     this.hoverSuppressionCleanup();
                 }
                 this.hoverSuppressionCleanup = null;
+            }
+
+            stopMapClickSuppression() {
+                if (typeof this.mapClickSuppressionCleanup === 'function') {
+                    this.mapClickSuppressionCleanup();
+                }
+                this.mapClickSuppressionCleanup = null;
             }
 
             stopViewMoreSuppression() {
@@ -1230,6 +2085,7 @@
                     this.viewMoreObserver = null;
                 }
                 this.stopHoverSuppression();
+                this.stopMapClickSuppression();
             }
 
             startFrameTimeOverlay() {
@@ -1276,8 +2132,96 @@
 
             extractFrameTimestamp(url) {
                 const decoded = decodeURIComponent(String(url || ''));
-                const match = decoded.match(/\/default\/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)\//);
-                return match ? match[1] : null;
+                const pathMatch = decoded.match(/\/default\/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)(?:\/|$)/i);
+                if (pathMatch && pathMatch[1]) {
+                    return pathMatch[1];
+                }
+
+                const queryMatch = decoded.match(/[?&]time=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)(?:[&#]|$)/i);
+                if (queryMatch && queryMatch[1]) {
+                    return queryMatch[1];
+                }
+
+                try {
+                    const parsedUrl = new URL(decoded, window.location.origin);
+                    const queryTime =
+                        parsedUrl.searchParams.get('time') ||
+                        parsedUrl.searchParams.get('TIME') ||
+                        parsedUrl.searchParams.get('Time');
+                    if (queryTime) {
+                        const candidate = String(queryTime).split('/')[0].trim();
+                        if (Number.isFinite(Date.parse(candidate))) {
+                            return candidate;
+                        }
+                    }
+                } catch (error) {
+                    // ignore malformed URLs and return null.
+                }
+
+                return null;
+            }
+
+            isRadarTimelineEntryUrl(url) {
+                const decoded = decodeURIComponent(String(url || ''));
+                const normalized = decoded.toLowerCase();
+                if (!normalized || !normalized.includes('/wmts/1.0.0/')) {
+                    return false;
+                }
+
+                return this.radarFrameLayerIds.some((layerId) => (
+                    normalized.includes(`/wmts/1.0.0/${layerId.toLowerCase()}/`) ||
+                    normalized.includes(`layer=${layerId.toLowerCase()}`) ||
+                    normalized.includes(`layer=${encodeURIComponent(layerId).toLowerCase()}`)
+                ));
+            }
+
+            collectRadarFrameEntries() {
+                return this.collectResourceEntries()
+                    .filter((entry) => entry && entry.name && this.isRadarTimelineEntryUrl(entry.name))
+                    .map((entry) => ({
+                        time: entry.startTime || 0,
+                        timestamp: this.extractFrameTimestamp(entry.name)
+                    }))
+                    .filter((item) => Boolean(item.timestamp));
+            }
+
+            ensureRadarTimelineFromFrameEntries(frameEntries) {
+                if (Array.isArray(this.radarFrameTimeline) && this.radarFrameTimeline.length >= 2) {
+                    return false;
+                }
+
+                if (!Array.isArray(frameEntries) || frameEntries.length < 2) {
+                    return false;
+                }
+
+                const uniqueTimeline = Array.from(
+                    new Set(
+                        frameEntries
+                            .map((item) => String(item && item.timestamp ? item.timestamp : '').trim())
+                            .filter((value) => Boolean(value) && Number.isFinite(Date.parse(value)))
+                            .sort((a, b) => Date.parse(a) - Date.parse(b))
+                    )
+                );
+
+                if (uniqueTimeline.length < 2) {
+                    return false;
+                }
+
+                this.radarFrameTimeline = uniqueTimeline;
+                this.defaultFrameTotal = uniqueTimeline.length;
+
+                const existing = this.normalizeFramePosition(this.lastFramePosition);
+                if (!existing || existing.total !== uniqueTimeline.length) {
+                    const nextCurrent = existing
+                        ? Math.max(1, Math.min(uniqueTimeline.length, existing.current))
+                        : 1;
+                    this.lastFramePosition = {
+                        current: nextCurrent,
+                        total: uniqueTimeline.length
+                    };
+                }
+
+                return true;
             }
 
             formatFrameTimestamp(timestamp) {
@@ -1295,6 +2239,39 @@
                 });
 
                 return `${localText}`;
+            }
+
+            formatTimelineLabelForFrame(framePosition) {
+                if (!framePosition || !Array.isArray(this.radarFrameTimeline) || this.radarFrameTimeline.length < 2) {
+                    return null;
+                }
+
+                const current = Math.round(Number(framePosition.current));
+                if (!Number.isFinite(current) || current < 1) {
+                    return null;
+                }
+
+                const index = Math.max(0, Math.min(this.radarFrameTimeline.length - 1, current - 1));
+                const timestamp = this.radarFrameTimeline[index];
+                if (!timestamp) {
+                    return null;
+                }
+
+                return this.formatFrameTimestamp(timestamp);
+            }
+
+            isRadarTimelineStale(maxAgeMs = 3 * 60 * 60 * 1000) {
+                if (!Array.isArray(this.radarFrameTimeline) || this.radarFrameTimeline.length < 2) {
+                    return true;
+                }
+
+                const latestTimestamp = this.radarFrameTimeline[this.radarFrameTimeline.length - 1];
+                const latestMs = Date.parse(String(latestTimestamp || ''));
+                if (!Number.isFinite(latestMs)) {
+                    return true;
+                }
+
+                return Date.now() - latestMs > maxAgeMs;
             }
 
             abbreviateWeekdayLabel(label) {
@@ -2139,13 +3116,19 @@
                     const fastMode = Boolean(options.fast);
                     const frameDoc = options.frameDoc || this.frame.contentDocument || this.frame.contentWindow.document;
                     const throttledMode = this.shouldUseThrottledAnimation();
-                    const sliderState = throttledMode ? null : this.findTimelineSliderState(frameDoc);
+                    const sliderState = this.findTimelineSliderState(frameDoc);
                     const sliderPosition = sliderState
                         ? { current: Number(sliderState.current), total: Number(sliderState.total) }
                         : null;
-                    const domLabel =
-                        this.extractFrameLabelFromSliderState(sliderState) ||
-                        this.extractFrameLabelFromDOM(frameDoc);
+                    const domLabel = throttledMode
+                        ? (
+                            this.extractFrameLabelFromSliderState(sliderState) ||
+                            this.extractFrameLabelFromDOM(frameDoc)
+                        )
+                        : (
+                            this.extractFrameLabelFromSliderState(sliderState) ||
+                            this.extractFrameLabelFromDOM(frameDoc)
+                        );
                     let framePosition = throttledMode
                         ? this.lastFramePosition
                         : (this.updateLastFramePosition(sliderPosition) || sliderPosition);
@@ -2155,15 +3138,11 @@
                     }
 
                     let fallbackLabel = null;
-                    const preferEntrySignals = this.shouldUseThrottledAnimation();
+                    const timelineUnavailable = !Array.isArray(this.radarFrameTimeline) || this.radarFrameTimeline.length < 2;
+                    const timelineStale = throttledMode && this.isRadarTimelineStale();
+                    const preferEntrySignals = throttledMode && (timelineUnavailable || timelineStale);
                     if ((!fastMode && (!domLabel || !framePosition)) || preferEntrySignals) {
-                        const frameEntries = this.collectResourceEntries()
-                            .filter((entry) => entry && entry.name && entry.name.includes('/wmts/1.0.0/'))
-                            .map((entry) => ({
-                                time: entry.startTime || 0,
-                                timestamp: this.extractFrameTimestamp(entry.name)
-                            }))
-                            .filter((item) => Boolean(item.timestamp));
+                        const frameEntries = this.collectRadarFrameEntries();
 
                         if (frameEntries.length) {
                             frameEntries.sort((a, b) => a.time - b.time);
@@ -2172,9 +3151,12 @@
                             const entryPosition = this.extractFramePositionFromEntries(frameEntries);
 
                             if (preferEntrySignals) {
+                                if (timelineUnavailable) {
+                                    this.ensureRadarTimelineFromFrameEntries(frameEntries);
+                                }
                                 fallbackLabel = entryLabel;
                                 // In throttled mode, keep x/y tied to the internal step counter.
-                                // WMTS request order can be noisy (prefetch/retries) and may look like 1/6.
+                                // Use radar-only entries for label fallback when metadata timeline is stale/missing.
                                 void entryPosition;
                             } else {
                                 fallbackLabel = entryLabel;
@@ -2197,7 +3179,12 @@
                         this.lastFramePosition = framePosition;
                     }
 
-                    const effectiveLabel = domLabel || fallbackLabel || '';
+                    const timelineLabel = throttledMode && !this.isRadarTimelineStale()
+                        ? this.formatTimelineLabelForFrame(framePosition)
+                        : null;
+                    const effectiveLabel = throttledMode
+                        ? (timelineLabel || domLabel || fallbackLabel || '')
+                        : (timelineLabel || domLabel || fallbackLabel || '');
                     if (throttledMode) {
                         const normalizedLabel = this.normalizeText(effectiveLabel);
                         if (normalizedLabel) {

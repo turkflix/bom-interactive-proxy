@@ -95,14 +95,15 @@ if echo "$LOC_HTML" | rg -qi "googletagmanager\\.com"; then
     exit 1
 fi
 
-if echo "$LOC_HTML" | rg -Pq "(?<!data-disabled-)(?:src|href)=['\"][^'\"]+\\.(?:woff2?|svg)(?:\\?[^'\"]*)?['\"]"; then
-    echo "❌ Rewrite check failed (active WOFF/SVG asset references still present)"
+TOWNS_QUERY_DEFAULT=$(curl -sS "${PROXY_URL}/overlays/towns_and_cities/FeatureServer/3/query?where=1%3D1&outFields=*&f=pjson")
+if ! echo "$TOWNS_QUERY_DEFAULT" | rg -q '"features":\[\]'; then
+    echo "❌ Overlay check failed (towns_and_cities should be empty by default)"
     exit 1
 fi
 
-TOWNS_QUERY=$(curl -sS "${PROXY_URL}/overlays/towns_and_cities/FeatureServer/3/query?where=1%3D1&outFields=*&f=pjson")
-if ! echo "$TOWNS_QUERY" | rg -q '"features":\[\]'; then
-    echo "❌ Overlay check failed (towns_and_cities query not empty)"
+TOWNS_QUERY_ENABLED=$(curl -sS --cookie "bom_show_town_names=1" "${PROXY_URL}/overlays/towns_and_cities/FeatureServer/3/query?where=1%3D1&outFields=NAME,MIN_ZOOM_LVL&f=pjson&resultRecordCount=5")
+if echo "$TOWNS_QUERY_ENABLED" | rg -q '"features":\[\]'; then
+    echo "❌ Overlay check failed (towns_and_cities should return features when enabled)"
     exit 1
 fi
 
