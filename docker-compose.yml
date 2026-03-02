@@ -6,6 +6,7 @@ services:
       - "${HOST_PORT:-8083}:80"
     environment:
       - TZ=Australia/Melbourne
+      - NGINX_CACHE_PATH=${CACHE_CONTAINER_PATH:-/tmp/nginx_cache}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/health"]
@@ -14,8 +15,8 @@ services:
       retries: 3
       start_period: 40s
     volumes:
-      # Optional: persist nginx cache
-      - ./cache:/tmp/nginx_cache
+      # Optional: persist nginx cache (customizable host/container paths)
+      - ${CACHE_HOST_PATH:-./cache}:${CACHE_CONTAINER_PATH:-/tmp/nginx_cache}
     labels:
       - "com.docker.compose.project=bom-proxy"
       - "description=BOM Interactive Weather Map Proxy"

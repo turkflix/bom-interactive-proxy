@@ -47,6 +47,13 @@ Frontend dashboard card code is intentionally out of scope and should live in a 
   - `map-sw.js` intercepts WMTS/overlay/basemap tile image requests.
   - Returns cached tile responses for up to 60 seconds before refreshing.
   - This helps when animation loops revisit the same frame URLs.
+- **Configurable cache directory (Docker):**
+  - Container cache root is controlled by `NGINX_CACHE_PATH` (default: `/tmp/nginx_cache`).
+  - `docker-compose.yml`/`docker-compose.dev.yml` expose:
+    - `CACHE_HOST_PATH` (default: `./cache`)
+    - `CACHE_CONTAINER_PATH` (default: `/tmp/nginx_cache`)
+  - Example:
+    - `CACHE_HOST_PATH=/mnt/fast-ssd/bom-cache CACHE_CONTAINER_PATH=/var/cache/bom docker compose up -d`
 - **Lean page-script policy (default):**
   - `/location/...` responses send a restrictive same-origin CSP and remove `Link` preconnect headers.
   - `/location/...` HTML is served with `Cache-Control: no-store` so stale pre-strip pages are not reused by the browser.
@@ -127,6 +134,8 @@ Because `/map-only` injects internal flags, effective defaults are:
 docker run -d \
   --name bom-proxy \
   -p 8083:80 \
+  -e NGINX_CACHE_PATH=/var/cache/bom \
+  -v /your/host/cache/path:/var/cache/bom \
   ghcr.io/turkflix/bom-interactive-proxy:latest
 ```
 

@@ -53,5 +53,9 @@ aspect_ratio: 100%
 ## Notes
 
 - If port `8083` is in use, change the host port mapping.
+- Cache path is configurable in Docker compose:
+  - `CACHE_HOST_PATH=/your/host/cache/path`
+  - `CACHE_CONTAINER_PATH=/your/container/cache/path` (must match `NGINX_CACHE_PATH`)
+  - Example: `CACHE_HOST_PATH=/mnt/fast-ssd/bom-cache CACHE_CONTAINER_PATH=/var/cache/bom docker compose up -d`
 - If map tiles fail, restart the container/app and re-test.
 - Dashboard custom card support should be implemented in a separate repository that talks to this proxy.

@@ -61,9 +61,26 @@ jobs:
       - name: Test image
         if: github.event_name != 'pull_request'
         run: |
-          docker run --rm -d --name test-proxy -p 8083:80 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          sleep 10
-          curl -f http://localhost:8083/health || exit 1
+          set -euo pipefail
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker run --rm -d --name test-proxy -p 8083:80 "${IMAGE_REF}"
+
+          ok=0
+          for attempt in $(seq 1 20); do
+            if curl -fsS http://localhost:8083/health >/dev/null; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "❌ Health check failed for ${IMAGE_REF}"
+            docker ps -a || true
+            docker logs test-proxy || true
+            exit 1
+          fi
+
           docker stop test-proxy
           echo "✅ Docker image test passed!"
 
